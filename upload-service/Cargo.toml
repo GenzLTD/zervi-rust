@@ -1,0 +1,89 @@
+[package]
+name = "upload-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 共享库
+common = { path = "../shared/common" }
+consul-client = { path = "../shared/consul-client" }
+
+# Web框架
+axum = { workspace = true, features = ["multipart"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors", "limit"] }
+
+# 异步运行时
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+
+# 数据库
+sea-orm = { workspace = true }
+
+# 序列化
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 日志
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = "1.0"
+
+# 时间
+chrono = "0.4"
+
+# UUID
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# 字节处理
+bytes = "1.5"
+
+# 文件类型检测
+infer = "0.15"
+
+# PDF解析
+pdf-extract = "0.7"
+lopdf = "0.32"
+
+# DOCX解析
+docx-rs = "0.4"
+zip = "0.6"
+quick-xml = "0.31"
+
+# Excel解析
+calamine = "0.24"
+
+# HTML解析
+scraper = "0.17"
+
+# HTTP客户端（用于OSS和DeepSeek）
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+
+# 环境变量
+dotenv = "0.15"
+
+# JWT
+jsonwebtoken = "9.2"
+
+# 密码加密
+argon2 = "0.5"
+
+# Hash计算
+sha2 = "0.10"
+
+# 验证
+validator = { version = "0.16", features = ["derive"] }
+
+# 正则表达式（用于JD解析）
+regex = "1.10"
+lazy_static = "1.4"
+
+# 本地 LLM 推理（自主可控）
+# 注意：llama_cpp_rs 需要编译 C++ 代码，可能需要较长时间
+llama_cpp_rs = "0.3"
+num_cpus = "1.16"
+rand = "0.8"
+async-trait = "0.1"

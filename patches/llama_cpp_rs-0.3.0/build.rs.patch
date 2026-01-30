@@ -1,0 +1,40 @@
+--- patches/llama_cpp_rs-0.3.0/build.rs.orig	2025-11-17 09:51:01
++++ /Users/szjason72/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/llama_cpp_rs-0.3.0/build.rs	2025-11-17 09:51:23
+@@ -130,14 +130,31 @@
+         cxx.flag(cxx_flag);
+     }
+ 
+-    let ggml_obj = PathBuf::from(&out_path).join("llama.cpp/ggml.o");
++    // 修复：使用静态库链接而不是硬编码的对象文件路径
++    // cc::Build 编译 ggml 时会生成 libggml.a，我们应该链接它
++    println!("cargo:rustc-link-search=native={}", out_path.display());
++    println!("cargo:rustc-link-lib=static=ggml");
+ 
+-    cxx.object(ggml_obj);
+-
++    // 如果启用了特定功能（如 metal），也需要链接对应的对象文件
++    // 但首先尝试找到实际生成的文件
+     if !ggml_type.is_empty() {
+-        let ggml_feature_obj =
+-            PathBuf::from(&out_path).join(format!("llama.cpp/ggml-{}.o", ggml_type));
+-        cxx.object(ggml_feature_obj);
++        // 查找实际生成的对象文件（可能带哈希前缀）
++        let out_dir = std::fs::read_dir(out_path).expect("Cannot read OUT_DIR");
++        let feature_pattern = format!("ggml-{}", ggml_type);
++        
++        for entry in out_dir {
++            if let Ok(entry) = entry {
++                let file_name = entry.file_name();
++                let name_str = file_name.to_string_lossy();
++                
++                // 查找匹配的对象文件（可能以哈希前缀开头）
++                if name_str.contains(&feature_pattern) && name_str.ends_with(".o") {
++                    let feature_obj = entry.path();
++                    cxx.object(&feature_obj);
++                    break;
++                }
++            }
++        }
+     }
+ 
+     cxx.shared_flag(true)

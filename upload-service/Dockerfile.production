@@ -1,0 +1,67 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# upload-service 生产环境Dockerfile
+# 
+# 特性：
+#   - 多阶段构建（优化镜像大小）
+#   - 非root用户运行
+#   - 最小化依赖
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 1: 构建阶段
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FROM rust:1.70 as builder
+
+WORKDIR /app
+
+# 复制Cargo配置
+COPY Cargo.toml Cargo.lock ./
+COPY upload-service/Cargo.toml ./upload-service/
+COPY shared/ ./shared/
+
+# 复制源代码
+COPY upload-service/src ./upload-service/src
+
+# 构建发布版本
+RUN cargo build --release --bin upload-service
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 2: 运行阶段
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FROM debian:bookworm-slim
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ⭐ 创建非root用户
+RUN useradd -m -u 1000 -s /bin/bash appuser
+
+# 创建工作目录
+WORKDIR /app
+
+# 创建必要目录
+RUN mkdir -p /app/uploads /app/logs && \
+    chown -R appuser:appuser /app
+
+# 复制编译好的二进制文件
+COPY --from=builder /app/target/release/upload-service /usr/local/bin/upload-service
+RUN chmod +x /usr/local/bin/upload-service
+
+# ⭐ 切换到非root用户
+USER appuser
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-3007}/health || exit 1
+
+# 暴露端口
+EXPOSE 3007
+
+# 启动服务
+CMD ["upload-service"]
+

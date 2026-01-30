@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "api-gateway",
+    "upload-service",
+    "auth-service",
+    "user-service",
+    # Phase 2服务（暂时注释）
+    # "job-service",
+    # "resume-service",
+    # "application-service",
+    # "company-service",
+    "shared/common",
+    "shared/consul-client",
+    "shared/service-auth",  # 服务间认证库
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ADIRP Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Web框架
+axum = { version = "0.7", features = ["multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "limit"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 数据库
+sea-orm = { version = "0.12", features = ["sqlx-mysql", "runtime-tokio-rustls", "macros"] }
+sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls"] }
+
+# 认证
+jsonwebtoken = "9.2"
+bcrypt = "0.15"
+argon2 = "0.5"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# HTTP客户端
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+
+# Redis
+redis = { version = "0.23", features = ["tokio-comp", "connection-manager"] }
+
+# 验证
+validator = { version = "0.16", features = ["derive"] }
+
+# 配置
+config = "0.13"
+dotenvy = "0.15"
+
+# 其他
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+bytes = "1.0"
+
