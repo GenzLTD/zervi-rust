@@ -62,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/application/*path",
             any(route_to_application_service),
         )
+        // JobFirst M0 Slice（收件箱）
+        .route("/api/v1/slice/*path", any(route_to_jobfirst_slice))
         // 企业服务路由
         .route("/api/v1/company/*path", any(route_to_company_service))
         // 上传服务路由
@@ -82,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     info!("   - /api/v1/resume/*           -> resume-service");
     info!("   - /api/v1/job/*              -> job-service");
     info!("   - /api/v1/application/*      -> application-service");
+    info!("   - /api/v1/slice/*            -> jobfirst-slice-service");
     info!("   - /api/v1/company/*          -> company-service");
     info!("   - /api/v1/upload/*           -> upload-service");
     info!("   - /api/*                     -> legacy backend (temp)");
@@ -135,6 +138,14 @@ async fn route_to_application_service(
     req: Request,
 ) -> Response {
     route_to_service(&state, "application-service", 3005, &path, req).await
+}
+
+async fn route_to_jobfirst_slice(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    req: Request,
+) -> Response {
+    route_to_service(&state, "jobfirst-slice-service", 3005, &path, req).await
 }
 
 async fn route_to_company_service(

@@ -4,6 +4,7 @@ members = [
     "upload-service",
     "auth-service",
     "user-service",
+    "jobfirst-slice-service",
     # Phase 2服务（暂时注释）
     # "job-service",
     # "resume-service",

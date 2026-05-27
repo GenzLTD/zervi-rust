@@ -1,0 +1,17 @@
+[package]
+name = "jobfirst-slice-service"
+version.workspace = true
+edition.workspace = true
+description = "JobFirst M0 inbox slice — in-memory, single deployable unit"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true

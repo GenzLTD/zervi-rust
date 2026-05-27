@@ -1,6 +1,13 @@
+# Zervi Rust — JobFirst 后端
+
+> **JobFirst**（求职 AI 助理）的 canonical 后端实现。  
+> 产品叙事与工程边界见 [../JOBFIRST.md](../JOBFIRST.md) · 服务对照 [../docs/SERVICE_MIGRATION.md](../docs/SERVICE_MIGRATION.md)
+
+---
+
 # Rust Microservices Cluster
 
-> **高性能微服务架构** - 基于Rust的现代化微服务实现
+> **高性能微服务架构** - 基于 Rust 的现代化微服务实现
 
 ## 🎯 项目简介
 

@@ -1,0 +1,98 @@
+[
+  {
+    "id": "job-001",
+    "title": "后端开发工程师",
+    "company_name": "示例科技有限公司",
+    "company_credit_code": "91310000MA1XXXX001",
+    "jd_text": "负责 Rust 或 Go 微服务开发，熟悉 MySQL、Redis，有 API 网关经验。",
+    "keywords": ["rust", "go", "微服务", "mysql", "redis", "api", "网关"]
+  },
+  {
+    "id": "job-002",
+    "title": "全栈工程师",
+    "company_name": "星河创新实验室",
+    "company_credit_code": "91310000MA1XXXX002",
+    "jd_text": "React 与 Node 全栈，了解求职或 HR Tech 领域加分。",
+    "keywords": ["react", "node", "全栈", "typescript", "hr"]
+  },
+  {
+    "id": "job-003",
+    "title": "AI 应用工程师",
+    "company_name": "智聘未来科技",
+    "company_credit_code": "91310000MA1XXXX003",
+    "jd_text": "LLM 应用落地，简历解析与职位匹配，Python 与 FastAPI。",
+    "keywords": ["llm", "python", "fastapi", "简历", "匹配", "agent"]
+  },
+  {
+    "id": "job-004",
+    "title": "Rust 系统工程师",
+    "company_name": "云栈数科",
+    "company_credit_code": "91310000MA1XXXX004",
+    "jd_text": "高性能网关与分布式存储，Tokio、axum，熟悉 Linux 运维。",
+    "keywords": ["rust", "tokio", "axum", "网关", "分布式", "linux"]
+  },
+  {
+    "id": "job-005",
+    "title": "DevOps 工程师",
+    "company_name": "链启信息",
+    "company_credit_code": "91310000MA1XXXX005",
+    "jd_text": "K8s、CI/CD、可观测性，支撑多租户 SaaS 发布。",
+    "keywords": ["k8s", "devops", "ci", "cd", "observability", "saas"]
+  },
+  {
+    "id": "job-006",
+    "title": "数据工程师",
+    "company_name": "数澜科技",
+    "company_credit_code": "91310000MA1XXXX006",
+    "jd_text": "ETL、数据仓库、招聘行为分析报表。",
+    "keywords": ["etl", "数据", "warehouse", "sql", "分析", "招聘"]
+  },
+  {
+    "id": "job-007",
+    "title": "产品经理（B2B）",
+    "company_name": "才汇软件",
+    "company_credit_code": "91310000MA1XXXX007",
+    "jd_text": "HR SaaS 方向，熟悉企业招聘流程与合规要求。",
+    "keywords": ["产品", "b2b", "hr", "saas", "招聘", "合规"]
+  },
+  {
+    "id": "job-008",
+    "title": "测试开发工程师",
+    "company_name": "质信互联",
+    "company_credit_code": "91310000MA1XXXX008",
+    "jd_text": "API 自动化、契约测试，保障微服务发布质量。",
+    "keywords": ["测试", "api", "自动化", "契约", "微服务", "质量"]
+  },
+  {
+    "id": "job-009",
+    "title": "安全工程师",
+    "company_name": "安盾科技",
+    "company_credit_code": "91310000MA1XXXX009",
+    "jd_text": "应用安全、渗透测试、零信任接入。",
+    "keywords": ["安全", "渗透", "零信任", "oauth", "审计"]
+  },
+  {
+    "id": "job-010",
+    "title": "移动端工程师（HarmonyOS）",
+    "company_name": "触达智能",
+    "company_credit_code": "91310000MA1XXXX010",
+    "jd_text": "鸿蒙通知、LiveView、可穿戴设备联动。",
+    "keywords": ["harmonyos", "移动端", "通知", "liveview", "可穿戴"]
+  },
+  {
+    "id": "job-011",
+    "title": "算法工程师（NLP）",
+    "company_name": "语义工场",
+    "company_credit_code": "91310000MA1XXXX011",
+    "jd_text": "简历-JD 对齐、检索排序、可解释推荐。",
+    "keywords": ["nlp", "检索", "排序", "简历", "jd", "推荐"]
+  },
+  {
+    "id": "job-012",
+    "title": "客户成功经理",
+    "company_name": "优才企业服务",
+    "company_credit_code": "91310000MA1XXXX012",
+    "jd_text": "企业客户 onboarding、投递效果复盘与续约。",
+    "keywords": ["客户成功", "onboarding", "企业服务", "续约", "招聘"]
+  }
+]
