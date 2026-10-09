@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", axum::routing::get(health_check))
         // GFCC ask 单入口：网关鉴权后转发到 Tatha 主仓（Python 中央大脑）
         .route("/v1/ask", post(tatha::ask))
+        // 量子认证兼容端点：Tatha 的 QUANTUM_AUTH_URL 指向此处
+        .route("/v1/auth/verify", axum::routing::get(tatha::verify))
         // 认证服务路由
         .route("/api/v1/auth/*path", any(route_to_auth_service))
         // 用户服务路由
@@ -84,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     info!("🔍 Routes:");
     info!("   - /health                    -> Health check");
     info!("   - /v1/ask                    -> tatha (Python brain, gated)");
+    info!("   - /v1/auth/verify            -> token introspection for tatha");
     info!("   - /api/v1/auth/*             -> auth-service");
     info!("   - /api/v1/user/*             -> user-service");
     info!("   - /api/v1/resume/*           -> resume-service");
