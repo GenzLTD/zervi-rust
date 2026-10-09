@@ -19,6 +19,11 @@ serde_json.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 
+# 网关侧鉴权与身份哈希（/v1/ask → Tatha）
+jsonwebtoken.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
 # 共享库（已在正确路径）
 common = { path = "../shared/common" }
 consul-client = { path = "../shared/consul-client" }

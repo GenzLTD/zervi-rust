@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Request, State},
     http::{header, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, post},
     Router,
 };
 use consul_client::ServiceDiscovery;
@@ -11,6 +11,8 @@ use reqwest::Client;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
+
+mod tatha;
 
 #[derive(Clone)]
 struct AppState {
@@ -49,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
     // 构建路由
     let app = Router::new()
         .route("/health", axum::routing::get(health_check))
+        // GFCC ask 单入口：网关鉴权后转发到 Tatha 主仓（Python 中央大脑）
+        .route("/v1/ask", post(tatha::ask))
         // 认证服务路由
         .route("/api/v1/auth/*path", any(route_to_auth_service))
         // 用户服务路由
@@ -79,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     info!("📍 Consul: http://localhost:8500");
     info!("🔍 Routes:");
     info!("   - /health                    -> Health check");
+    info!("   - /v1/ask                    -> tatha (Python brain, gated)");
     info!("   - /api/v1/auth/*             -> auth-service");
     info!("   - /api/v1/user/*             -> user-service");
     info!("   - /api/v1/resume/*           -> resume-service");
