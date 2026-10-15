@@ -18,6 +18,9 @@ mod tatha;
 struct AppState {
     http_client: Client,
     service_discovery: Arc<ServiceDiscovery>,
+    /// JWKS 公钥缓存（ADR-0012 D1）；未配置 `GATEWAY_JWKS_URL` 时为 `None`，
+    /// 此时网关仅接受 HS256（looma 代签 / 存量 token）。
+    jwks: Option<Arc<tatha::JwksCache>>,
 }
 
 #[tokio::main]
@@ -34,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         http_client: Client::new(),
         service_discovery: Arc::new(ServiceDiscovery::new()),
+        jwks: tatha::jwks_cache_from_env(),
     };
 
     // 配置CORS

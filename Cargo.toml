@@ -41,7 +41,7 @@ sea-orm = { version = "0.12", features = ["sqlx-mysql", "runtime-tokio-rustls", 
 sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls"] }
 
 # 认证
-jsonwebtoken = "9.2"
+jsonwebtoken = { version = "9.2", features = ["jwk"] }
 bcrypt = "0.15"
 argon2 = "0.5"
 
