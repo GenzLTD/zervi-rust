@@ -31,7 +31,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{
-    decode, decode_header, jwk::Jwk, Algorithm, DecodingKey, Validation,
+    decode, decode_header,
+    jwk::{Jwk, KeyAlgorithm},
+    Algorithm, DecodingKey, Validation,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -57,6 +59,13 @@ const SUPABASE_AUDIENCE: &str = "authenticated";
 /// JWKS 缓存寿命，对齐 looma `PyJWKClient(lifespan=600)`。
 /// 缓存是硬要求：不得每请求拉网（ADR-0012 D1.1）。
 const JWKS_TTL: Duration = Duration::from_secs(600);
+/// JWKS 最小重试间隔：距上次**尝试**（成功或失败都算）不足此值时不再出网。
+///
+/// 防两件事：
+/// - 未认证触发的出网放大：任何人可构造 `{"alg":"ES256","kid":"<随机>"}` 打到
+///   `/v1/ask`；若每个未知 `kid` 都触发一次拉取，即变成对 Supabase JWKS 的放大
+/// - 拉取失败后的每请求重试：失败时缓存内容不更新，没有节流就会一直重试
+const JWKS_MIN_REFRESH: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct GatewayClaims {
@@ -123,7 +132,10 @@ struct JwksDocument {
 }
 
 struct JwksCache {
+    /// 上次**成功**拉取的时间 —— 用于 TTL 新鲜度判断
     fetched_at: Instant,
+    /// 上次**尝试**的时间（成功或失败都推进）—— 用于重试节流
+    last_attempt_at: Instant,
     keys: Vec<Jwk>,
 }
 
@@ -139,55 +151,122 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
-/// 按 `kid` 找 JWK → `DecodingKey`。
-fn jwk_to_key(keys: &[Jwk], kid: &str) -> Option<DecodingKey> {
+/// 按 `kid` 找 JWK → `DecodingKey`；JWK 自身若声明了 `alg`，必须与 header 的
+/// `alg` 一致才采用（防止 key 与算法错配）。
+fn jwk_to_key(keys: &[Jwk], kid: &str, alg: Algorithm) -> Option<DecodingKey> {
     keys.iter()
         .find(|j| j.common.key_id.as_deref() == Some(kid))
+        .filter(|j| match j.common.key_algorithm {
+            Some(declared) => key_alg_to_alg(declared) == Some(alg),
+            None => true, // JWK 未声明 alg 时不做额外限制
+        })
         .and_then(|j| DecodingKey::from_jwk(j).ok())
 }
 
-/// 取 `kid` 对应的验签 key：缓存新鲜则直接返回，否则拉取一次并写回。
+/// JWK 侧的 `KeyAlgorithm` → JWT 侧的 `Algorithm`。
+///
+/// 两者是独立枚举且无现成转换。JWK 还含仅用于**加密**的变体
+/// （`RSA1_5` / `A128KW` 等），那些一律视为不匹配 ⇒ 对应 key 不被采用。
+fn key_alg_to_alg(declared: KeyAlgorithm) -> Option<Algorithm> {
+    Some(match declared {
+        KeyAlgorithm::HS256 => Algorithm::HS256,
+        KeyAlgorithm::HS384 => Algorithm::HS384,
+        KeyAlgorithm::HS512 => Algorithm::HS512,
+        KeyAlgorithm::ES256 => Algorithm::ES256,
+        KeyAlgorithm::ES384 => Algorithm::ES384,
+        KeyAlgorithm::RS256 => Algorithm::RS256,
+        KeyAlgorithm::RS384 => Algorithm::RS384,
+        KeyAlgorithm::RS512 => Algorithm::RS512,
+        KeyAlgorithm::PS256 => Algorithm::PS256,
+        KeyAlgorithm::PS384 => Algorithm::PS384,
+        KeyAlgorithm::PS512 => Algorithm::PS512,
+        KeyAlgorithm::EdDSA => Algorithm::EdDSA,
+        _ => return None,
+    })
+}
+
+/// 取 `kid` 对应的验签 key。
+///
+/// 出网有两道闸门，缺一不可 —— 否则未认证请求可放大成对 Supabase JWKS 的攻击：
+///
+/// 1. 缓存**新鲜**时一律以缓存为准：命中返回 key、未命中返回 `None`，
+///    **绝不出网**。构造随机 `kid` 的请求因此不会各自触发一次拉取，
+///    也不会反复覆写缓存
+/// 2. 缓存过期才允许刷新，且受 `JWKS_MIN_REFRESH` 节流：拉取失败后不会
+///    退化成每请求都重试
 ///
 /// 刻意**不在持锁期间 await** —— 先拉网、再取写锁写入，临界区内无 await。
 /// 拉取失败返回 `None` ⇒ 调用方转 401（fail-closed，不回落）。
-async fn jwks_key(kid: &str) -> Option<DecodingKey> {
+async fn jwks_key(kid: &str, alg: Algorithm) -> Option<DecodingKey> {
     let url = env_nonempty(ENV_JWKS_URL)?;
 
-    // 快路径：缓存新鲜
+    // 闸门 1：缓存新鲜 → 以缓存为准，绝不出网
     {
         let guard = jwks_cache().read().ok()?;
         if let Some(c) = guard.as_ref() {
             if c.fetched_at.elapsed() < JWKS_TTL {
-                if let Some(k) = jwk_to_key(&c.keys, kid) {
-                    return Some(k);
-                }
+                return jwk_to_key(&c.keys, kid, alg);
+            }
+        }
+    }
+
+    // 闸门 2：距上次尝试不足最小间隔 → 继续用旧缓存，不出网
+    {
+        let guard = jwks_cache().read().ok()?;
+        if let Some(c) = guard.as_ref() {
+            if c.last_attempt_at.elapsed() < JWKS_MIN_REFRESH {
+                return jwk_to_key(&c.keys, kid, alg);
             }
         }
     }
 
     // 慢路径：拉网（不持锁）
-    let doc: JwksDocument = http_client()
-        .get(&url)
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let fetched: Option<Vec<Jwk>> = match http_client().get(&url).send().await {
+        Ok(resp) => resp.json::<JwksDocument>().await.ok().map(|d| d.keys),
+        Err(e) => {
+            warn!("⚠️  JWKS fetch failed ({}): {}", ENV_JWKS_URL, e);
+            None
+        }
+    };
 
     {
         let mut guard = jwks_cache().write().ok()?;
-        *guard = Some(JwksCache {
-            fetched_at: Instant::now(),
-            keys: doc.keys,
-        });
+        let now = Instant::now();
+        let has_cache = guard.is_some();
+        match fetched {
+            Some(keys) => {
+                *guard = Some(JwksCache {
+                    fetched_at: now,
+                    last_attempt_at: now,
+                    keys,
+                });
+            }
+            // 失败且已有旧缓存：保留旧 key 集，只推进尝试时间戳以便节流
+            None if has_cache => {
+                if let Some(c) = guard.as_mut() {
+                    c.last_attempt_at = now;
+                }
+            }
+            // 失败且无缓存：建一条「已过期」的空缓存，使后续请求走节流而非直连
+            None => {
+                *guard = Some(JwksCache {
+                    fetched_at: now.checked_sub(JWKS_TTL).unwrap_or(now),
+                    last_attempt_at: now,
+                    keys: Vec::new(),
+                });
+            }
+        }
     }
 
     let guard = jwks_cache().read().ok()?;
-    jwk_to_key(&guard.as_ref()?.keys, kid)
+    jwk_to_key(&guard.as_ref()?.keys, kid, alg)
 }
 
 /// 非对称算法走 JWKS 轨（Supabase 原生 token）。
+///
+/// 注释与实现对齐：ES256 / ES384 / RS256 / RS384 / RS512 / PS256 / PS384 /
+/// PS512 / EdDSA —— 凡非对称即走 JWKS。HS384 / HS512 虽同属 HMAC 族，但
+/// ADR 只提 HS256 轨，故一律拒（fail-closed）。
 fn is_asymmetric(alg: Algorithm) -> bool {
     matches!(
         alg,
@@ -208,6 +287,11 @@ fn is_asymmetric(alg: Algorithm) -> bool {
 ///
 /// 两轨都未配置时同样返回 `None` —— 无法鉴权即拒绝，不降级、不回落 stub。
 async fn verify_bearer(authorization: Option<&HeaderValue>) -> Option<GatewayClaims> {
+    // 两轨皆未配置 ⇒ 无法鉴权，直接拒：既不解析 token，也不触发任何出网
+    if env_nonempty(ENV_JWT_SECRET).is_none() && env_nonempty(ENV_JWKS_URL).is_none() {
+        return None;
+    }
+
     let raw = authorization?.to_str().ok()?.trim().to_string();
     let token = raw
         .strip_prefix("Bearer ")
@@ -222,8 +306,11 @@ async fn verify_bearer(authorization: Option<&HeaderValue>) -> Option<GatewayCla
     let mut validation = Validation::new(header.alg);
 
     if header.alg == Algorithm::HS256 {
-        // HS256 轨：looma 代签 / 存量 looma token。保持既有的 aud 宽松策略，
-        // 不给存量 token 增加新的拒绝面。
+        // HS256 轨：looma 代签 / 存量 looma token。
+        //
+        // **必须**明文关掉 aud 校验：jsonwebtoken 的 `Validation::new()` 默认
+        // `validate_aud = true`，不关则存量 looma token 当场全挂。
+        // 这不是可选的对齐，是维持存量可用的必要条件。
         let secret = env_nonempty(ENV_JWT_SECRET)?;
         validation.validate_aud = false;
         decode::<GatewayClaims>(
@@ -236,7 +323,7 @@ async fn verify_bearer(authorization: Option<&HeaderValue>) -> Option<GatewayCla
     } else if is_asymmetric(header.alg) {
         // JWKS 轨：Supabase 原生 token（ES256 为主），校验 aud=authenticated
         let kid = header.kid.as_deref()?;
-        let key = jwks_key(kid).await?;
+        let key = jwks_key(kid, header.alg).await?;
         validation.validate_aud = true;
         validation.aud = Some(HashSet::from([SUPABASE_AUDIENCE.to_string()]));
         decode::<GatewayClaims>(token, &key, &validation)
