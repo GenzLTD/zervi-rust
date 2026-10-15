@@ -27,7 +27,7 @@
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{
@@ -56,6 +56,12 @@ const ENV_SERVICE_TOKEN: &str = "TATHA_SERVICE_TOKEN";
 const ENV_DEFAULT_TIER: &str = "GATEWAY_DEFAULT_TIER";
 /// Supabase 原生 token 的受众（对齐 looma `jwt_handler.py` 的 `aud=authenticated`）
 const SUPABASE_AUDIENCE: &str = "authenticated";
+/// 网关独占注入的头部前缀。
+///
+/// 转发前一律剥离客户端自带的同名头，**按前缀而非逐个点名**：注入是条件性的
+/// （如 `X-User-Email-Hash` 仅在 token 带 email 时写入），逐个点名迟早会在新增
+/// 头时漏掉一个，而漏掉的那一个恰好就是可伪造的入口。
+const X_USER_PREFIX: &str = "x-user-";
 /// JWKS 缓存寿命，对齐 looma `PyJWKClient(lifespan=600)`。
 /// 缓存是硬要求：不得每请求拉网（ADR-0012 D1.1）。
 const JWKS_TTL: Duration = Duration::from_secs(600);
@@ -391,10 +397,28 @@ pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
     {
         let headers = req.headers_mut();
         headers.remove(header::AUTHORIZATION);
+
+        // 剥离客户端自带的 `x-user-*` 头（P0）：
+        // 身份注入是**条件性**的 —— `X-User-Email-Hash` 仅在 token 带 email 时
+        // 写入；不清理的话，持「无 email claim 的合法 token」（D2 明确允许的小
+        // 程序-only 用户）即可自带 `X-User-Email-Hash: <任意>` 直通下游。该头是
+        // 跨端关联键，放任等于把身份挂到别人的跨端身份上 —— 越权，不是可用性问题。
+        //
+        // 按前缀清理而非逐个点名：将来新增 `x-user-*` 头时不会重蹈覆辙。
+        let forged: Vec<HeaderName> = headers
+            .keys()
+            .filter(|k| k.as_str().starts_with(X_USER_PREFIX))
+            .cloned()
+            .collect();
+        for k in forged {
+            headers.remove(k);
+        }
+
         if let Ok(v) = HeaderValue::from_str(&uid) {
             headers.insert("X-User-Id", v);
         }
-        // 无真实邮箱（小程序-only 用户）时不注入该头，保持 email_hash=None 语义
+        // 无真实邮箱（小程序-only 用户）时**不注入**该头 —— 上面的剥离已保证它
+        // 不会以客户端携带的值漏出，从而维持 D2 的 email_hash=None 语义
         if let Some(email) = claims
             .email
             .as_deref()
