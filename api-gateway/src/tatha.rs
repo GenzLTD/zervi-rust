@@ -132,8 +132,14 @@ struct JwksDocument {
 }
 
 struct JwksCache {
-    /// 上次**成功**拉取的时间 —— 用于 TTL 新鲜度判断
-    fetched_at: Instant,
+    /// 上次**成功**拉取的时间；`None` = 从未成功过。
+    ///
+    /// 刻意用 `Option` 而不是「造一个过去的时间戳」来表达"从未成功"：
+    /// `Instant` 在 macOS/Linux 上取 CLOCK_MONOTONIC（开机时长），用
+    /// `checked_sub(JWKS_TTL)` 伪造"已过期"会在 uptime < TTL 时退化成
+    /// "刚刚成功"，空缓存于是被判为新鲜 —— TTL 内既不重试也不出网，
+    /// 全程静默 401。`Option` 让这个 hack 整个消失。
+    fetched_at: Option<Instant>,
     /// 上次**尝试**的时间（成功或失败都推进）—— 用于重试节流
     last_attempt_at: Instant,
     keys: Vec<Jwk>,
@@ -187,37 +193,72 @@ fn key_alg_to_alg(declared: KeyAlgorithm) -> Option<Algorithm> {
 
 /// 取 `kid` 对应的验签 key。
 ///
-/// 出网有两道闸门，缺一不可 —— 否则未认证请求可放大成对 Supabase JWKS 的攻击：
+/// 三条约束必须同时成立，缺一不可 —— 它们彼此是有张力的，只满足其中两条
+/// 都会出事：
 ///
-/// 1. 缓存**新鲜**时一律以缓存为准：命中返回 key、未命中返回 `None`，
-///    **绝不出网**。构造随机 `kid` 的请求因此不会各自触发一次拉取，
-///    也不会反复覆写缓存
-/// 2. 缓存过期才允许刷新，且受 `JWKS_MIN_REFRESH` 节流：拉取失败后不会
-///    退化成每请求都重试
+/// 1. **放大有界**：未认证请求可构造任意 `kid`，若每个未知 `kid` 都触发一次
+///    拉取，就变成对 Supabase JWKS 的放大攻击。故刷新受 `JWKS_MIN_REFRESH`
+///    节流，最坏 ≤ 1 次 / 30s
+/// 2. **轮换可见**：缓存新鲜但 `kid` 未命中时**不能**直接返回 `None`。
+///    那样即使堵住了放大，也会让 Supabase 轮换 kid 之后、持新 kid 的 token
+///    在最长 `JWKS_TTL` 内全部 401，且**零次刷新尝试**（10 分钟无法登录，
+///    生产事故量级）。未命中应落到节流后的刷新，把轮换响应压到 ≤ 30s
+/// 3. **占位式节流**：`last_attempt_at` 必须在**出网之前**于写锁内 claim，
+///    否则冷启动或窗口刚过时，并发 N 个请求会同时通过闸门、出网 N 次
 ///
-/// 刻意**不在持锁期间 await** —— 先拉网、再取写锁写入，临界区内无 await。
-/// 拉取失败返回 `None` ⇒ 调用方转 401（fail-closed，不回落）。
+/// 刻意**不在持锁期间 await** —— claim 与写回都是短临界区，拉网发生在锁外。
+/// 最终取不到 key 则返回 `None` ⇒ 调用方转 401（fail-closed，不回落）。
 async fn jwks_key(kid: &str, alg: Algorithm) -> Option<DecodingKey> {
     let url = env_nonempty(ENV_JWKS_URL)?;
 
-    // 闸门 1：缓存新鲜 → 以缓存为准，绝不出网
+    // 闸门 1：缓存新鲜且**命中** → 直接返回，不出网
+    let mut missed_in_fresh_cache = false;
     {
         let guard = jwks_cache().read().ok()?;
         if let Some(c) = guard.as_ref() {
-            if c.fetched_at.elapsed() < JWKS_TTL {
-                return jwk_to_key(&c.keys, kid, alg);
+            let fresh = c.fetched_at.map(|t| t.elapsed() < JWKS_TTL).unwrap_or(false);
+            if fresh {
+                if let Some(k) = jwk_to_key(&c.keys, kid, alg) {
+                    return Some(k);
+                }
+                // 未命中：此处**不** return None —— 见文档第 2 点（轮换盲窗）
+                missed_in_fresh_cache = true;
             }
         }
     }
 
-    // 闸门 2：距上次尝试不足最小间隔 → 继续用旧缓存，不出网
+    // 闸门 2 + 占位 claim：窗口内沿用旧缓存（不出网），窗口外先 claim 再出网
     {
-        let guard = jwks_cache().read().ok()?;
-        if let Some(c) = guard.as_ref() {
-            if c.last_attempt_at.elapsed() < JWKS_MIN_REFRESH {
-                return jwk_to_key(&c.keys, kid, alg);
+        let mut guard = jwks_cache().write().ok()?;
+        let now = Instant::now();
+        match guard.as_mut() {
+            Some(c) => {
+                if c.last_attempt_at.elapsed() < JWKS_MIN_REFRESH {
+                    // 窗口内：沿用现有缓存；未命中即 None，不出网
+                    return jwk_to_key(&c.keys, kid, alg);
+                }
+                c.last_attempt_at = now; // claim（见文档第 3 点）
+            }
+            None => {
+                // 首次：占位条目，keys 为空、fetched_at 为 None（从未成功）
+                *guard = Some(JwksCache {
+                    fetched_at: None,
+                    last_attempt_at: now,
+                    keys: Vec::new(),
+                });
             }
         }
+    }
+
+    // 已确定要出网 —— 日志放在这里，频率因此同样 ≤ 1 次 / JWKS_MIN_REFRESH。
+    // kid 由请求方控制，截断后再记录，避免日志注入与刷屏。
+    if missed_in_fresh_cache {
+        let safe_kid: String = kid.chars().take(64).collect();
+        warn!(
+            "⚠️  JWKS: kid absent from fresh cache (kid={}); refreshing (throttled to 1/{}s)",
+            safe_kid,
+            JWKS_MIN_REFRESH.as_secs()
+        );
     }
 
     // 慢路径：拉网（不持锁）
@@ -230,32 +271,17 @@ async fn jwks_key(kid: &str, alg: Algorithm) -> Option<DecodingKey> {
     };
 
     {
-        let mut guard = jwks_cache().write().ok()?;
         let now = Instant::now();
-        let has_cache = guard.is_some();
-        match fetched {
-            Some(keys) => {
-                *guard = Some(JwksCache {
-                    fetched_at: now,
-                    last_attempt_at: now,
-                    keys,
-                });
-            }
-            // 失败且已有旧缓存：保留旧 key 集，只推进尝试时间戳以便节流
-            None if has_cache => {
-                if let Some(c) = guard.as_mut() {
-                    c.last_attempt_at = now;
-                }
-            }
-            // 失败且无缓存：建一条「已过期」的空缓存，使后续请求走节流而非直连
-            None => {
-                *guard = Some(JwksCache {
-                    fetched_at: now.checked_sub(JWKS_TTL).unwrap_or(now),
-                    last_attempt_at: now,
-                    keys: Vec::new(),
-                });
-            }
+        let mut guard = jwks_cache().write().ok()?;
+        // 上面的 claim 已保证条目存在（首次会占位）
+        let c = guard.as_mut()?;
+        if let Some(keys) = fetched {
+            c.fetched_at = Some(now);
+            c.keys = keys;
         }
+        // 拉取失败：保留旧 key 集（瞬时故障不该洗掉缓存、导致合法鉴权全挂），
+        // fetched_at 不动 —— 于是缓存保持"已过期 / 从未成功"，下次走节流重试
+        c.last_attempt_at = now;
     }
 
     let guard = jwks_cache().read().ok()?;
