@@ -6,3 +6,20 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+# 共享库（AppError / Result / ApiResponse）
+common = { path = "../shared/common" }
+
+axum.workspace = true
+tokio.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+# genzltd（PostgreSQL 17 + pgvector）
+sea-orm.workspace = true
+
+tracing.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+reqwest.workspace = true

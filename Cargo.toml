@@ -5,11 +5,11 @@ members = [
     "auth-service",
     "user-service",
     "jobfirst-slice-service",
-    # Phase 2服务（暂时注释）
-    # "job-service",
-    # "resume-service",
-    # "application-service",
-    # "company-service",
+    # Phase 2服务（2026-10-16 启用：以 genzltd_schema_v0.2.sql 为基准补齐缺口）
+    "job-service",
+    "resume-service",
+    "application-service",
+    "company-service",
     "shared/common",
     "shared/consul-client",
     "shared/service-auth",  # 服务间认证库
@@ -38,8 +38,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # 数据库
-sea-orm = { version = "0.12", features = ["sqlx-mysql", "runtime-tokio-rustls", "macros"] }
-sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls"] }
+# ⚠️ 2026-10-16：**追加** postgres feature（不替换 mysql），避免波及继承本项的服务
+#    （upload-service / auth-service / user-service / shared/common 均已 sea-orm.workspace = true）
+#    四服务（resume/job/application/company）连 genzltd（PostgreSQL 17 + pgvector）
+#    sea-orm 0.12 支持多 driver feature 并存，成本仅为编译时间
+sea-orm = { version = "0.12", features = ["sqlx-mysql", "sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-json"] }
+sqlx = { version = "0.7", features = ["mysql", "postgres", "runtime-tokio-rustls", "json", "chrono"] }
 
 # 认证
 jsonwebtoken = "9.2"
