@@ -492,3 +492,131 @@ pub async fn verify(req: Request) -> Response {
     )
         .into_response()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 测试
+//
+// 本文件内是**纯函数**层；HTTP 端到端层在 `main.rs` 的 `#[cfg(test)]` —— 因为
+// `AppState` 定义在 main.rs，且本 crate 是 binary（无 lib.rs），`tests/` 下的
+// 集成测试访问不到这些项。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 仅供测试：清空 JWKS 缓存。
+///
+/// 缓存是进程级 `static`，端到端用例之间会互相污染（一旦填充，`JWKS_TTL` 内
+/// 后续用例都会命中它）。端到端层靠它把缓存恢复初始态，使「首次拉取」与
+/// 「伪造 kid 不放大出网」这类断言可复现。
+#[cfg(test)]
+pub(crate) fn reset_jwks_cache() {
+    if let Ok(mut guard) = jwks_cache().write() {
+        *guard = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUB_A: &str = "11111111-2222-3333-4444-555555555555";
+    const SUB_B: &str = "99999999-8888-7777-6666-555555555555";
+
+    // ── 稳定主键（ADR-0012 D2）──
+
+    #[test]
+    fn stable_user_id_is_deterministic_and_input_sensitive() {
+        assert_eq!(stable_user_id(SUB_A), stable_user_id(SUB_A));
+        assert_ne!(stable_user_id(SUB_A), stable_user_id(SUB_B));
+    }
+
+    /// D2 的核心属性：换邮箱**不影响**稳定主键（email 可变，sub 不变）。
+    /// 对应手测 #8：同一 supabase_uid 跨 provider 登录，`X-User-Id` 逐字节相同。
+    #[test]
+    fn stable_user_id_is_independent_of_email() {
+        assert_eq!(stable_user_id(SUB_A), stable_user_id(SUB_A));
+        // 与 email 哈希不是一回事 —— 防止两者在实现里被弄混
+        assert_ne!(stable_user_id(SUB_A), email_hash("foo@bar.com"));
+    }
+
+    #[test]
+    fn stable_user_id_trims_input() {
+        assert_eq!(
+            stable_user_id(SUB_A),
+            stable_user_id(&format!("  {}\n", SUB_A))
+        );
+    }
+
+    // ── 邮箱归一化（跨端关联键口径）──
+
+    #[test]
+    fn email_hash_normalizes_case_and_trim() {
+        assert_eq!(email_hash("Foo@Bar.com"), email_hash("foo@bar.com"));
+        assert_eq!(
+            email_hash("  Other@Example.COM  "),
+            email_hash("other@example.com")
+        );
+    }
+
+    #[test]
+    fn normalize_email_lowercases_and_trims() {
+        assert_eq!(normalize_email("  Foo@Bar.COM "), "foo@bar.com");
+    }
+
+    // ── 档位解析 ──
+
+    #[test]
+    fn resolve_tier_maps_known_values_and_falls_back_to_free() {
+        let cases = [
+            ("free", "free"),
+            ("basic", "basic"),
+            ("pro", "pro"),
+            ("PRO", "pro"),         // 大小写不敏感
+            (" platinum ", "free"), // 未知档位一律 free，不放宽
+        ];
+        for (input, want) in cases {
+            let claims = GatewayClaims {
+                sub: SUB_A.to_string(),
+                email: None,
+                tier: Some(input.to_string()),
+            };
+            assert_eq!(resolve_tier(&claims), want, "tier={:?}", input);
+        }
+    }
+
+    // ── key / alg 一致性断言（评审第 2 条）──
+
+    #[test]
+    fn key_alg_to_alg_maps_signing_algorithms() {
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::ES256), Some(Algorithm::ES256));
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::RS256), Some(Algorithm::RS256));
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::HS256), Some(Algorithm::HS256));
+    }
+
+    /// JWK 中仅用于**加密**的变体（本版本为 `RSA1_5` / `RSA_OAEP` /
+    /// `RSA_OAEP_256`）一律视为不匹配 ⇒ 对应 key 不被采用。
+    #[test]
+    fn key_alg_to_alg_rejects_encryption_only_algorithms() {
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::RSA1_5), None);
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::RSA_OAEP), None);
+        assert_eq!(key_alg_to_alg(KeyAlgorithm::RSA_OAEP_256), None);
+    }
+
+    // ── kid + alg 匹配 ──
+
+    const TEST_JWKS: &str = r#"{"keys":[{"kty":"EC","crv":"P-256","kid":"test-es256-key","x":"ms838wlssr0NRhf_YNGM9oBxV63fZjOT1zcUlB6D2lo","y":"uooQG1fUzOdpmzf9syMzKztmGp_GJjhKVROKWx1L_fU","alg":"ES256","use":"sig"}]}"#;
+
+    fn test_keys() -> Vec<Jwk> {
+        let doc: JwksDocument = serde_json::from_str(TEST_JWKS).expect("测试用 JWKS 应可解析");
+        doc.keys
+    }
+
+    #[test]
+    fn jwk_to_key_matches_kid_and_requires_alg() {
+        let keys = test_keys();
+        // kid 命中且 alg 一致 ⇒ 采用
+        assert!(jwk_to_key(&keys, "test-es256-key", Algorithm::ES256).is_some());
+        // alg 与 header 不符 ⇒ 不采用（防止 key 与算法错配）
+        assert!(jwk_to_key(&keys, "test-es256-key", Algorithm::RS256).is_none());
+        // kid 未知 ⇒ None
+        assert!(jwk_to_key(&keys, "no-such-kid", Algorithm::ES256).is_none());
+    }
+}
