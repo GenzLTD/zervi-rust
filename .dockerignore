@@ -1,0 +1,16 @@
+# 构建上下文瘦身：避免把 target/、.git、本地脚本塞进镜像与缓存层
+.git
+.gitignore
+target
+**/target
+**/node_modules
+**/*.md
+
+# 仓库根目录的本地运维脚本（非构建输入）
+⚡*
+🔧*
+强制*
+清理*
+
+# Cargo.toml 无 [patch] 段引用它，构建不需要
+patches
