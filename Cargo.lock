@@ -125,6 +125,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -622,6 +624,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "jsonwebtoken",
+ "reqwest",
  "sea-orm",
  "serde",
  "serde_json",
@@ -645,6 +649,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1753,6 +1759,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2991,6 +2999,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
