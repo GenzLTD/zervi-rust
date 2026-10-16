@@ -1,0 +1,44 @@
+# api-gateway 是 ADR-0012《THOMAS 生态身份统一》定义的「网关唯一验签点」，
+# 也是单 1（双轨验签 + 双头注入）的落地处。本仓此前没有任何 CI，
+# 该目录的改动因此缺少最小门禁。本工作流只做一件事：保证 api-gateway 能编译、能构建测试。
+#
+# 为什么不是 `cargo check --workspace`：
+#   1. upload-service 依赖 llama_cpp_rs（需在 runner 上编译 C++/llama.cpp），干净环境构建失败；
+#   2. 根 Cargo.toml 中 Phase-2 服务（job-service / resume-service /
+#      application-service / company-service）处于注释状态。
+#   ⇒ 全工作区 check 在本地与 CI 都会红，且红的原因与被改代码无关，会变成噪声门禁。
+#
+# 本次刻意不纳入的门禁（避免引入「出生即长期红」的假门禁）：
+#   - `cargo fmt --all --check`：现有代码非 fmt-clean（实测 59 行差异，含 api-gateway/src/tatha.rs）
+#   - `cargo clippy -p api-gateway -- -D warnings`：common 库存在既有 lint（div_ceil）
+#   两者建议先各自做一次独立的格式化/整改 PR，再开门禁。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-gateway:
+    name: api-gateway (check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check -p api-gateway --locked
+        run: cargo check -p api-gateway --locked
+
+      - name: cargo test -p api-gateway --locked
+        run: cargo test -p api-gateway --locked
