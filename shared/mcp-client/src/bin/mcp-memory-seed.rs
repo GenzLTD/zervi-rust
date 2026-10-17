@@ -30,7 +30,14 @@
 //! - `0` 全部写入成功，且所有闸门都过了（没配闸门 = 没有闸门要过）；
 //! - `1` 有失败（含 denied / 超时 / recall 报错）；
 //! - `2` 参数或文件问题（含「闸门配了却没配 `--verify-query`」——见下）；
-//! - `3` **写得不对**：写入本身成功，但内容没通过闸门（缺主题词 / 出现禁用词）。
+//! - `3` **写得不对 / 验不出东西**：写入本身成功，但内容没通过闸门（缺主题词 /
+//!   出现禁用词），或**无从判定** —— `hits=0`（空库 / kind 全被过滤，注入块恒空、
+//!   Δ 恒 0），或 hits 非空但一条可读文本都取不到（返回形状变了，闸门读不到内容
+//!   就只会判「不匹配/未泄漏」，那是假通过）。
+//!
+//! 最后这两种以前是 **exit 0**：闸门一声不响跳过，hook 当成「过了」—— 正是
+//! 本工具反复栽的「看起来通过、其实没测」。「没测到」不属于 exit 1（没写进去），
+//! 归 3 才和「写得不对」共用同一条语义：这批注入不能拿来跑 A/B。
 //!
 //! 退出码 3 的单独立项不是洁癖：hook 里 `if seed; then run ab; fi` 只看得到
 //! 成功/失败，分不清「没写进去」（1）和「写进去了但不是同类岗位」（3）。
@@ -184,6 +191,70 @@ fn terms_present(hits: &[serde_json::Value], terms: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 闸门判定结果。打印需要的明细都在这里，退出码只看 `verdict`。
+struct GateReport {
+    /// 命中条数（recall 返回的 k）。
+    hits: usize,
+    /// 命中里**能读出文本**的条数。为 0 而 hits 非空 ⇒ 返回形状变了，闸门读不到东西。
+    readable: usize,
+    /// 主题词里在命中集出现过的（大小写不敏感）。
+    matched_topics: Vec<String>,
+    /// 禁用词里在命中集出现过的 —— 非空即泄漏。
+    leaked: Vec<String>,
+    /// `None` = 通过；`Some(_)` = 一律 exit 3。
+    verdict: Option<GateVerdict>,
+}
+
+/// 为什么判不过。**全部映射到 exit 3**，与「没写进去」(1) / 「参数错」(2) 分开。
+#[derive(Debug, PartialEq)]
+enum GateVerdict {
+    /// 一条都没检索到：空库或 kind 全被过滤 ⇒ 注入块恒空、Δ 恒 0，等于没测。
+    EmptyHits,
+    /// 有 hits 但一条可读文本都取不到：闸门只会判「不匹配 / 未泄漏」，是假通过。
+    Unreadable,
+    /// 主题词一个都没命中：preload 内容与本次岗位不匹配。
+    TopicsMismatch,
+    /// 出现禁用词：本轮简历的姓名 / 公司漏进了参考段。
+    Leaked,
+}
+
+/// 把「能不能用这批注入跑 A/B」压成一个判定。
+///
+/// 单独抽出来是为了能单测：这段以前内联在 `main` 里，`hits=0` 只 println 一句
+/// 警告、退出码仍是 0 —— 谁也没法给它写断言。判定顺序按危害从大到小：
+/// 先看有没有东西可判，再看内容对不对，最后才看泄漏。
+fn evaluate_gates(
+    hits: &[serde_json::Value],
+    topics: Option<&[String]>,
+    forbidden: Option<&[String]>,
+) -> GateReport {
+    let readable = hits.iter().filter(|h| hit_content(h).is_some()).count();
+    let matched_topics = topics.map(|t| terms_present(hits, t)).unwrap_or_default();
+    let leaked = forbidden
+        .map(|f| terms_present(hits, f))
+        .unwrap_or_default();
+
+    let verdict = if hits.is_empty() {
+        Some(GateVerdict::EmptyHits)
+    } else if readable == 0 {
+        Some(GateVerdict::Unreadable)
+    } else if topics.is_some() && matched_topics.is_empty() {
+        Some(GateVerdict::TopicsMismatch)
+    } else if !leaked.is_empty() {
+        Some(GateVerdict::Leaked)
+    } else {
+        None
+    };
+
+    GateReport {
+        hits: hits.len(),
+        readable,
+        matched_topics,
+        leaked,
+        verdict,
+    }
+}
+
 const HELP: &str = "\
 mcp-memory-seed —— A/B 注入前的记忆预置
 
@@ -197,6 +268,8 @@ mcp-memory-seed —— A/B 注入前的记忆预置
                            否则 exit 3（这条比「命中 K/K」诚实）
   --forbid-strings a,b,c   闸门：注入的 k 条里不许出现这些词（姓名/公司/学校），
                            出现即 exit 3（泄漏检查；脱敏只清证件/手机/邮箱）
+                           两个闸门都注意：hits=0、或命中集里一条可读文本都取不到时
+                           **也是 exit 3**（无从判定，不能算通过）
   --verify-only            不新增记忆，只跑 --verify-query 审计现有库内容
                            （注意 recall 会更新 access_count/last_accessed）
   --dry-run                只打印不写入
@@ -315,8 +388,9 @@ async fn main() -> ExitCode {
 
     let mut ok_ids: Vec<String> = Vec::new();
     let mut failed = 0usize;
-    // 内容闸门未过：写入本身成功，但内容不合格（缺主题词 / 出现禁用词）⇒ 单独退出码
-    let mut content_gate_failed = false;
+    // 闸门未过：写入本身成功，但这批注入不能拿来跑 A/B —— 内容不合格（缺主题词 /
+    // 出现禁用词），或**无从判定**（hits=0 / 一条可读文本都取不到）⇒ 单独退出码 3
+    let mut gate_failed = false;
     for (i, text) in texts.iter().enumerate() {
         let started = Instant::now();
         match client
@@ -387,9 +461,9 @@ async fn main() -> ExitCode {
                         .and_then(|v| v.as_str())
                         .unwrap_or("(无 id)")
                         .to_string();
-                    let content = h
-                        .get("content")
-                        .and_then(|v| v.as_str())
+                    // 与闸门同一口径（`hit_content`）：打印的必须是闸门实际读的那段文本。
+                    // 否则键名一变，人眼看到的（整段 JSON）和判定的（读不到）不是同一样东西。
+                    let content = hit_content(h)
                         .map(str::to_string)
                         .unwrap_or_else(|| h.to_string());
                     let head: String = content.chars().take(60).collect();
@@ -419,55 +493,66 @@ async fn main() -> ExitCode {
                     );
                 }
 
-                if hits.is_empty() {
-                    println!(
-                        "  ⚠️ hits=0 —— 空库或全部被 kind 过滤。此时注入块恒空、Δ 恒为 0，\
-                         看起来像「记忆无效」，其实是没测到。"
-                    );
+                let gates =
+                    evaluate_gates(&hits, require_topics.as_deref(), forbid_strings.as_deref());
+
+                // ① 无从判定：没检索到 / 读不出文本。这两种以前只打 ⚠️ 就 exit 0，
+                // hook 当成「过了」—— 「没测到」不能让 A/B 继续跑，归 exit 3。
+                if let Some(reason) = &gates.verdict {
+                    gate_failed = true;
+                    match reason {
+                        GateVerdict::EmptyHits => println!(
+                            "  ⚠️ hits=0 —— 空库或全部被 kind 过滤。此时注入块恒空、Δ 恒为 0，\
+                             看起来像「记忆无效」，其实是没测到 ⇒ exit 3（不是 0）"
+                        ),
+                        GateVerdict::Unreadable => println!(
+                            "  ⚠️ hits={} 但一条可读文本都取不到（没有 content/text/memory/… 键）\
+                             ⇒ 闸门读不到内容，只会判「不匹配/未泄漏」，那是假通过 ⇒ exit 3",
+                            gates.hits
+                        ),
+                        // 内容层面的失败在下面按闸门逐条打（那里有明细可展示）
+                        GateVerdict::TopicsMismatch | GateVerdict::Leaked => {}
+                    }
                 }
 
-                // 内容闸门。hits 为空时不跑：那是「没检索到」，上面已经报过，
-                // 别重复告警，也别把「没测到」误判成「内容不对」(exit 3)。
-                if !hits.is_empty() {
-                    // ① 主题词：至少命中一个，否则算 preload 跑偏
+                // ② 内容判定。只有读得出文本才谈得上；读不到时上面已报 Unreadable，
+                // 别在这里再判一次「不匹配」——那是同一件事说两遍，还会误导成内容问题。
+                if gates.readable > 0 {
+                    // 主题词：至少命中一个，否则算 preload 跑偏
                     if let Some(want) = &require_topics {
-                        let matched = terms_present(&hits, want);
                         println!(
                             "  主题词命中：{}/{}（{}）",
-                            matched.len(),
+                            gates.matched_topics.len(),
                             want.len(),
-                            if matched.is_empty() {
+                            if gates.matched_topics.is_empty() {
                                 "无".to_string()
                             } else {
-                                matched.join("、")
+                                gates.matched_topics.join("、")
                             }
                         );
-                        if matched.is_empty() {
+                        if gates.matched_topics.is_empty() {
                             println!(
                                 "  ⚠️ 注入的 {n} 条里没有任何一条含指定主题词 ⇒ preload 内容与本次\
                                  岗位不匹配。带着它跑 A/B，Δ≠0 也分不清是「记忆有用」还是「被无关\
                                  内容带偏」。先改 preload。",
-                                n = hits.len()
+                                n = gates.hits
                             );
-                            content_gate_failed = true;
                         }
                     }
 
-                    // ② 禁用词（姓名 / 公司 / 学校）：一个都不许出现。
+                    // 禁用词（姓名 / 公司 / 学校）：一个都不许出现。
                     // 为什么必须机械化：`redact()` 只清证件/手机/邮箱，姓名与公司是明确
                     // 交给 prompt 禁令兜的 —— 人眼在 5×60 字里找漏一个名字，比脚本容易漏。
                     if let Some(forbidden) = &forbid_strings {
-                        let leaked = terms_present(&hits, forbidden);
-                        if leaked.is_empty() {
+                        if gates.leaked.is_empty() {
                             println!("  禁用词：0/{} 未出现 ✓", forbidden.len());
                         } else {
                             println!(
                                 "  ⚠️ 注入的 {} 条里出现了禁用词：{} ⇒ 这是泄漏：本轮要传的那份\
                                  简历的姓名/公司不该出现在参考段里。先改 preload。",
-                                hits.len(),
-                                leaked.join("、")
+                                gates.hits,
+                                gates.leaked.join("、")
                             );
-                            content_gate_failed = true;
                         }
                     }
                 }
@@ -482,9 +567,11 @@ async fn main() -> ExitCode {
     client.close().await;
 
     if failed > 0 {
+        // 「没写进去」比「写得不对」更根本，优先归 1
         ExitCode::from(1)
-    } else if content_gate_failed {
-        // 写入成功但内容不合格：用一个分开的码，脚本 hook 能区分「没写进去」和「写得不对」
+    } else if gate_failed {
+        // 写进去了但这批注入不能用：内容不合格，或压根没验到（hits=0 / 读不出文本）。
+        // 用一个分开的码，脚本 hook 能区分「没写进去」和「写得不对/没测到」。
         ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
@@ -541,5 +628,86 @@ mod tests {
             terms_present(&hits, &forbidden),
             vec!["中国建设银行".to_string()]
         );
+    }
+
+    /// hits=0 = 没检索到，注入块恒空、Δ 恒 0 ⇒ 不能算通过。
+    /// 以前这里只打一句警告、退出码 0，hook 当成「过了」（P0）。
+    /// 注意：**没配任何闸门也一样判失败** —— 没内容就没验证发生。
+    #[test]
+    fn empty_hits_are_unverifiable() {
+        let gates = evaluate_gates(&[], None, None);
+        assert_eq!(gates.verdict, Some(GateVerdict::EmptyHits));
+        assert_eq!(gates.readable, 0);
+    }
+
+    /// 有 hits 但一条可读文本都取不到（返回形状变了）⇒ 闸门只会判「不匹配/未泄漏」，
+    /// 那是假通过（P1）。以前 `--forbid-strings` 会打印「0/N 未出现 ✓」并 exit 0。
+    #[test]
+    fn unreadable_hits_fail_instead_of_passing() {
+        let hits = vec![json!({"id": "m-1", "metadata": {"kind": "episodic"}})];
+        let forbidden = vec!["张三".to_string()];
+
+        let with_gate = evaluate_gates(&hits, None, Some(&forbidden));
+        assert_eq!(with_gate.hits, 1);
+        assert_eq!(with_gate.readable, 0);
+        assert_eq!(with_gate.verdict, Some(GateVerdict::Unreadable));
+        // 关键：禁用词确实一个都没匹配上，但那不代表「没泄漏」，只代表「读不到」
+        assert!(with_gate.leaked.is_empty());
+
+        // 没配闸门也一样：读不出内容就无从判定
+        assert_eq!(
+            evaluate_gates(&hits, None, None).verdict,
+            Some(GateVerdict::Unreadable)
+        );
+    }
+
+    /// 正常路径：内容可读、主题词命中、无禁用词 ⇒ 通过。
+    #[test]
+    fn readable_hits_with_topics_pass() {
+        let hits = vec![
+            json!({"id": "m-1", "content": "后端 岗位画像：Rust + MySQL"}),
+            json!({"id": "m-2", "content": "招聘 后端 工程师，要求 3 年"}),
+        ];
+        let topics = vec!["后端".to_string(), "Rust".to_string()];
+        let forbidden = vec!["张三".to_string()];
+
+        let gates = evaluate_gates(&hits, Some(&topics), Some(&forbidden));
+        assert_eq!(gates.readable, 2);
+        assert_eq!(
+            gates.matched_topics,
+            vec!["后端".to_string(), "Rust".to_string()]
+        );
+        assert!(gates.leaked.is_empty());
+        assert_eq!(gates.verdict, None);
+    }
+
+    /// 主题词一个都没命中 ⇒ 不是「通过」，是 preload 跑偏。
+    #[test]
+    fn topic_mismatch_is_failure() {
+        let hits = vec![json!({"content": "游戏策划 岗位画像"})];
+        let topics = vec!["后端".to_string()];
+        assert_eq!(
+            evaluate_gates(&hits, Some(&topics), None).verdict,
+            Some(GateVerdict::TopicsMismatch)
+        );
+    }
+
+    /// 泄漏优先级高于通过：哪怕主题词全中、内容很像，出现禁用词就是不合格。
+    #[test]
+    fn leak_fails_even_when_topics_match() {
+        let hits = vec![json!({"content": "后端 Rust，曾在 中国建设银行"})];
+        let topics = vec!["后端".to_string()];
+        let forbidden = vec!["中国建设银行".to_string()];
+
+        let gates = evaluate_gates(&hits, Some(&topics), Some(&forbidden));
+        assert_eq!(gates.verdict, Some(GateVerdict::Leaked));
+        assert_eq!(gates.leaked, vec!["中国建设银行".to_string()]);
+    }
+
+    /// 没配闸门时，内容可读就该 exit 0 —— 别把「只想看一眼库里有啥」也判失败。
+    #[test]
+    fn readable_hits_without_gates_pass() {
+        let hits = vec![json!({"content": "任意内容"})];
+        assert_eq!(evaluate_gates(&hits, None, None).verdict, None);
     }
 }
