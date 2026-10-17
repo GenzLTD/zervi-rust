@@ -295,6 +295,43 @@ fn unwrap_result_wrapper(value: serde_json::Value) -> serde_json::Value {
     value
 }
 
+/// `recall` 无命中时对端回的纯文本哨兵。
+///
+/// 以真实 cortex-mcp 源码为准（Mac 真机实测），不是猜的。
+const SEARCH_EMPTY_SENTINEL: &str = "no relevant memories";
+
+/// 把 `recall` 的返回 payload 归一化成命中列表。
+///
+/// ## 成功形状只有三种
+///
+/// JSON 数组 / `null` / 哨兵文本 `"no relevant memories"`。
+///
+/// ## 其余裸字符串是**错误文案伪装成成功**
+///
+/// `--kind` 传了非法值（如 `no_such_kind`）时，cortex-mcp `server.py` 把
+/// `f"invalid kind, must be one of {KINDS}"` 当**正常返回值**吐出（`is_error`
+/// 仍是 false）；`extract_payload` 的 JSON 解析失败又 fallback 成 `String`。
+/// 旧代码 `other => vec![other]` 于是把它当成**一条命中**：
+///
+/// ```text
+/// 验证 recall：hits=1
+/// 1. (无 id) invalid kind, must be one of ('working', 'episodic', …
+/// 禁用词：0/1 未出现 ✓        ← 假通过，exit 0
+/// ```
+///
+/// 这正是「闸门无从判定 ⇒ 假通过」换了入口再来一次，而且能读出文本，所以
+/// `GateVerdict::Unreadable` 拦不住。裸字符串从此只认哨兵，剩下的一律 `Err`，
+/// 由调用方计入 failed ⇒ exit 1（与「recall 报错」同码）。
+fn normalize_recall_payload(value: serde_json::Value) -> MemoryResult<Vec<serde_json::Value>> {
+    match value {
+        serde_json::Value::Array(items) => Ok(items),
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(s) if s.contains(SEARCH_EMPTY_SENTINEL) => Ok(Vec::new()),
+        serde_json::Value::String(s) => Err(format!("recall 返回非命中文案：{s}")),
+        other => Ok(vec![other]),
+    }
+}
+
 impl McpMemoryClient {
     /// 拉起子进程并握手。
     ///
@@ -427,8 +464,9 @@ impl McpMemoryClient {
     /// - `kind`：`working` / `episodic` / `semantic` / `procedural`，`None` 为不限；
     /// - `k`：返回条数。
     ///
-    /// 对端在无命中时返回纯文本 `"no relevant memories"`，这里归一化成**空数组**，
-    /// 免得调用方每次都要判断这是空结果还是错误。
+    /// 对端在无命中时返回纯文本 `"no relevant memories"`，这里归一化成**空数组**；
+    /// **除哨兵外的裸字符串一律当错误** —— 错误文案伪装成命中的坑见
+    /// [`normalize_recall_payload`]。
     pub async fn recall(
         &self,
         query: &str,
@@ -443,12 +481,7 @@ impl McpMemoryClient {
         }
 
         let value = self.call_tool("recall", args, self.recall_timeout).await?;
-        Ok(match value {
-            serde_json::Value::Array(items) => items,
-            serde_json::Value::Null => Vec::new(),
-            serde_json::Value::String(s) if s.contains("no relevant memories") => Vec::new(),
-            other => vec![other],
-        })
+        normalize_recall_payload(value)
     }
 
     /// 写入一条记忆（cortex-mcp `remember`）。
@@ -534,5 +567,63 @@ impl McpMemoryClient {
     pub async fn consolidate(&self) -> MemoryResult<serde_json::Value> {
         self.call_tool("consolidate_memories", serde_json::Map::new(), self.write_timeout)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 正常形状：数组原样透传，顺序不动。
+    #[test]
+    fn recall_payload_passes_array_through() {
+        let payload = json!([{"id": "m-1", "content": "后端"}, {"id": "m-2"}]);
+        let hits = normalize_recall_payload(payload).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["id"], "m-1");
+    }
+
+    /// 无命中的两种合法表达：`null` 与哨兵文本 ⇒ 空列表，不是错误。
+    #[test]
+    fn recall_payload_null_and_sentinel_are_empty() {
+        assert!(normalize_recall_payload(serde_json::Value::Null)
+            .unwrap()
+            .is_empty());
+        assert!(
+            normalize_recall_payload(json!("no relevant memories. Try different keywords."))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// **锁住这条**：错误文案不许当命中。
+    ///
+    /// 真机实测：`--kind no_such_kind` 时 cortex-mcp 回
+    /// `"invalid kind, must be one of ('working', …)"`，且 `is_error` 为 false。
+    /// 旧实现把它当一条命中（hits=1），再叠 `--forbid-strings` 会打印
+    /// 「0/1 未出现 ✓」exit 0 —— 假通过。现在必须 `Err`。
+    #[test]
+    fn recall_payload_error_string_is_err_not_hit() {
+        let err = normalize_recall_payload(json!(
+            "invalid kind, must be one of ('working', 'episodic', 'semantic', 'procedural')"
+        ))
+        .expect_err("错误文案不能被当成命中");
+        assert!(err.contains("invalid kind"), "错误信息要带原文：{err}");
+    }
+
+    /// 单个对象（对端不回数组的兜底）仍当一条命中，不要一刀切成错误。
+    #[test]
+    fn recall_payload_single_object_is_one_hit() {
+        let hits = normalize_recall_payload(json!({"id": "m-9", "content": "单条"})).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], "m-9");
+    }
+
+    /// 空串也算「非命中文案」吗？——算：真实对端不会回空串，回了就是异常。
+    /// 判成错误比判成「0 条命中」安全（后者会静默当成空库）。
+    #[test]
+    fn recall_payload_blank_string_is_err() {
+        assert!(normalize_recall_payload(json!("")).is_err());
     }
 }
