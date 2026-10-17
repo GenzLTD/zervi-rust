@@ -51,6 +51,13 @@ pub struct Config {
     pub mcp_connect_timeout_ms: u64,
     pub mcp_recall_timeout_ms: u64,
     pub mcp_write_timeout_ms: u64,
+    // A/B 测量面（默认 false）
+    //
+    // 开启后 `/upload` 响应体多一个 `extraction_digest`，并且**允许**用请求头
+    // `X-Memory-Mode: off` 单请求跳过记忆（只在开启时生效）。
+    // 为什么用请求头而不是重启换配置：A/B 两组必须共享同一个进程 / 同一份预热
+    // 过的 Ollama，否则测到的是冷启动差异，不是记忆的收益。
+    pub upload_extraction_digest: bool,
 }
 
 impl Config {
@@ -171,6 +178,11 @@ impl Config {
                 .unwrap_or_else(|_| "15000".to_string())
                 .parse()
                 .unwrap_or(15_000),
+            // A/B 测量面：默认关 ⇒ 对外契约形状完全不变。
+            upload_extraction_digest: env::var("UPLOAD_EXTRACTION_DIGEST")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
         }
     }
 }

@@ -1,0 +1,2 @@
+# 脚本在 Mac/Linux 上要能直接执行，避免 CRLF 破坏 shebang
+tools/*.py text eol=lf

@@ -26,6 +26,55 @@ pub struct UploadRecordWithMemory {
     /// 没参与的原因（未启用 / 启动失败 / 超时 / 子进程已退出）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_skip_reason: Option<String>,
+    /// **A/B 测量面**：仅 `UPLOAD_EXTRACTION_DIGEST=true` 时出现。
+    ///
+    /// 为什么必须有它：`/upload` 原本只返回分类 + JD，`extracted_info` /
+    /// `quality_score` 算完就丢（既不回传也不落库），所以「有记忆 vs 无记忆」
+    /// 两轮在响应体上看不出任何差异 —— 那种对比只能得出「两个 200 一样」。
+    /// 默认关闭 ⇒ 对外契约形状不变。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extraction_digest: Option<ExtractionDigest>,
+}
+
+/// 一次提取的**可测量指纹**（A/B 专用，默认不出现）。
+///
+/// 选这些字段的依据：「记忆有用」在简历场景里通常表现为**多识别出几项技能 /
+/// 多认出几段经历**，只看总分容易被抹平。所以技能、条数、四项评分、耗时
+/// 全留，且**不含姓名/手机/邮箱**（测量面不该扩大 PII 面）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionDigest {
+    /// 本次记忆层是否参与（= 外层 `memory_used` 的副本，为了单条记录自洽，
+    /// 便于 A/B 脚本只看 digest 就能判组）。
+    pub memory_used: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_skip_reason: Option<String>,
+    /// `resume` / `job_description` / `poetry_profile` / `other`
+    pub doc_type: String,
+    /// 传统分类（`Resume` / `CoverLetter` / `Certificate` / `Other`）
+    pub category: String,
+    pub classification_confidence: f64,
+    /// 提取（第一跳 LLM）耗时；非简历/诗人档案为 null
+    pub extraction_duration_ms: Option<i64>,
+    /// 质量评分（第二跳 LLM）耗时；非简历为 null
+    pub scoring_duration_ms: Option<i64>,
+    /// 整个 process_document 的墙钟耗时
+    pub processing_time_ms: i64,
+    pub quality: QualityDigest,
+    /// 技能前 10（顺序来自模型输出，不做排序，保持可比性）
+    pub skills: Vec<String>,
+    pub skills_count: usize,
+    pub education_count: usize,
+    pub work_count: usize,
+    pub extraction_confidence: f64,
+    pub quality_confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct QualityDigest {
+    pub overall_score: i32,
+    pub completeness: i32,
+    pub clarity: i32,
+    pub professionalism: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,4 +172,107 @@ pub struct ResumeInfoDto {
     pub extraction_confidence: f64,
     pub category: String,
     pub extracted_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_record() -> UploadRecord {
+        UploadRecord {
+            id: "up-1".into(),
+            original_name: "cv.pdf".into(),
+            file_size: 1024,
+            mime_type: "application/pdf".into(),
+            access_url: "/uploads/up-1".into(),
+            created_at: "2026-10-17 10:00:00".into(),
+            classification: None,
+            jd_info: None,
+        }
+    }
+
+    fn base_digest() -> ExtractionDigest {
+        ExtractionDigest {
+            memory_used: true,
+            memory_skip_reason: None,
+            doc_type: "Resume".into(),
+            category: "Resume".into(),
+            classification_confidence: 0.93,
+            extraction_duration_ms: Some(1200),
+            scoring_duration_ms: Some(800),
+            processing_time_ms: 2400,
+            quality: QualityDigest {
+                overall_score: 78,
+                completeness: 80,
+                clarity: 75,
+                professionalism: 79,
+            },
+            skills: vec!["Rust".into(), "SQL".into()],
+            skills_count: 12,
+            education_count: 2,
+            work_count: 3,
+            extraction_confidence: 0.88,
+            quality_confidence: 0.78,
+        }
+    }
+
+    /// 默认（测量面关闭）⇒ 响应体形状必须与上一版**逐键一致**：
+    /// 多出 `extraction_digest` 就是契约破坏。
+    #[test]
+    fn digest_absent_keeps_legacy_shape() {
+        let body = serde_json::to_value(UploadRecordWithMemory {
+            record: base_record(),
+            memory_used: false,
+            memory_skip_reason: Some("MCP_ENABLED=false（记忆层未启用）".into()),
+            extraction_digest: None,
+        })
+        .unwrap();
+
+        assert!(body.get("extraction_digest").is_none());
+        // flatten 的老字段仍在顶层
+        assert_eq!(body.get("id").unwrap(), "up-1");
+        assert_eq!(body.get("memory_used").unwrap(), false);
+        assert!(body.get("memory_skip_reason").is_some());
+    }
+
+    /// 开启后 digest 必须带够 A/B 判读要的字段（少一个都会让基线无法解释）。
+    #[test]
+    fn digest_carries_ab_signals() {
+        let body = serde_json::to_value(UploadRecordWithMemory {
+            record: base_record(),
+            memory_used: true,
+            memory_skip_reason: None,
+            extraction_digest: Some(base_digest()),
+        })
+        .unwrap();
+
+        let digest = body.get("extraction_digest").expect("应有 extraction_digest");
+        for key in [
+            "memory_used",
+            "doc_type",
+            "category",
+            "classification_confidence",
+            "extraction_duration_ms",
+            "scoring_duration_ms",
+            "processing_time_ms",
+            "quality",
+            "skills",
+            "skills_count",
+            "education_count",
+            "work_count",
+            "extraction_confidence",
+            "quality_confidence",
+        ] {
+            assert!(digest.get(key).is_some(), "digest 缺字段: {key}");
+        }
+        for key in ["overall_score", "completeness", "clarity", "professionalism"] {
+            assert!(
+                digest.get("quality").unwrap().get(key).is_some(),
+                "quality 缺字段: {key}"
+            );
+        }
+        // 测量面不得扩 PII：digest 里不允许出现姓名/手机/邮箱
+        let text = serde_json::to_string(&digest).unwrap();
+        assert!(!text.contains("phone") && !text.contains("email"));
+    }
 }

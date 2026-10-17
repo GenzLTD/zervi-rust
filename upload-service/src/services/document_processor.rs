@@ -301,6 +301,11 @@ impl DocumentProcessor {
         }
 
         // 5. 根据文档类型选择处理方式
+        //
+        // 两跳耗时单独留档（只进 A/B 的 extraction_digest，不进任何对外响应）：
+        // 记忆注入会同时拉长这两跳，只看总分无法区分「记忆收益」与「链路变慢」。
+        let mut extraction_duration_ms: Option<i64> = None;
+        let mut scoring_duration_ms: Option<i64> = None;
         let (extracted_info, quality_score, jd_info, poetry_profile) = match classification.doc_type
         {
             DocumentType::Resume => {
@@ -314,6 +319,7 @@ impl DocumentProcessor {
                 let extraction_start = std::time::Instant::now();
                 let extracted = self.llm_client.extract_resume_info(&parsed.text).await?;
                 let extraction_duration = extraction_start.elapsed();
+                extraction_duration_ms = Some(extraction_duration.as_millis() as i64);
                 tracing::info!("⏱️ LLM提取耗时: {:?}", extraction_duration);
 
                 // LLM质量评分
@@ -323,6 +329,7 @@ impl DocumentProcessor {
                     .score_quality(&extracted, &parsed.text)
                     .await?;
                 let score_duration = score_start.elapsed();
+                scoring_duration_ms = Some(score_duration.as_millis() as i64);
                 tracing::info!("⏱️ LLM评分耗时: {:?}", score_duration);
 
                 (Some(extracted), Some(quality), None, None)
@@ -353,6 +360,7 @@ impl DocumentProcessor {
                 let extraction_start = std::time::Instant::now();
                 let profile = self.llm_client.extract_poetry_profile(&parsed.text).await?;
                 let extraction_duration = extraction_start.elapsed();
+                extraction_duration_ms = Some(extraction_duration.as_millis() as i64);
                 tracing::info!("⏱️ LLM提取诗人档案耗时: {:?}", extraction_duration);
                 tracing::info!(
                     "📜 诗人档案信息: 姓名={:?}, 朝代={:?}, 作品数={}, 地点数={}, 事件数={}",
@@ -439,6 +447,8 @@ impl DocumentProcessor {
             extraction_confidence,
             jd_confidence,
             processing_time_ms: total_duration.as_millis() as i64,
+            extraction_duration_ms,
+            scoring_duration_ms,
         })
     }
 
@@ -671,6 +681,13 @@ pub struct ProcessedDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jd_confidence: Option<f64>,
     pub processing_time_ms: i64,
+    /// 第一跳（提取）耗时。`serde(skip)`：**只供 A/B digest 使用**，不进
+    /// `/uploads/:id/parsed` 等既有响应，避免测量面污染契约。
+    #[serde(skip)]
+    pub extraction_duration_ms: Option<i64>,
+    /// 第二跳（打分）耗时，同上。
+    #[serde(skip)]
+    pub scoring_duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

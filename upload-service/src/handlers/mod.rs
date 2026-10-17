@@ -4,11 +4,15 @@ mod optimize_handler;
 
 use axum::{
     extract::{Multipart, Path, State},
+    http::HeaderMap,
     Extension,
 };
 
 use crate::{
-    dto::{UploadDetail, UploadListItem, UploadRecord, UploadRecordWithMemory},
+    dto::{
+        ExtractionDigest, QualityDigest, UploadDetail, UploadListItem, UploadRecord,
+        UploadRecordWithMemory,
+    },
     services::UploadService,
     utils::{
         error::{AppError, Result},
@@ -31,9 +35,23 @@ pub use optimize_handler::{
 pub async fn upload_single(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<ApiResponse<UploadRecordWithMemory>> {
     use crate::dto::ClassificationDto;
+
+    // ── A/B 测量面开关（默认关，`UPLOAD_EXTRACTION_DIGEST=false`）──
+    //
+    // 开启时：① 响应体多 `extraction_digest`；② 允许请求头 `X-Memory-Mode: off`
+    // 单请求跳过记忆。用请求头而不是「重启换配置」，是因为两组必须共享同一个
+    // 进程和同一份预热的 Ollama —— 否则测到的是冷启动差异，不是记忆的收益。
+    let ab_enabled = state.config.upload_extraction_digest;
+    let ab_memory_off = ab_enabled
+        && headers
+            .get("x-memory-mode")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().eq_ignore_ascii_case("off"))
+            .unwrap_or(false);
 
     while let Some(field) = multipart
         .next_field()
@@ -86,14 +104,22 @@ pub async fn upload_single(
         let recall_query = format!("{} 简历 优化 历史反馈 目标岗位", file_name);
         let mut memory_skip_reason: Option<String> = None;
         let mut memory_used = true;
-        match state.memory.recall(&recall_query, Some("episodic"), 5).await {
-            Ok(hits) => {
-                tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
-            }
-            Err(reason) => {
-                tracing::warn!("⚠️  记忆层跳过（recall）: {}", reason);
-                memory_used = false;
-                memory_skip_reason = Some(reason);
+        if ab_memory_off {
+            // 对照组：跳过记忆，其余流程完全一致（同一进程、同一份预热模型）
+            memory_used = false;
+            memory_skip_reason =
+                Some("A/B 对照组：X-Memory-Mode: off（仅测量面开启时生效）".to_string());
+            tracing::info!("🧪 A/B 对照组：本请求跳过记忆（recall / remember 均不调）");
+        } else {
+            match state.memory.recall(&recall_query, Some("episodic"), 5).await {
+                Ok(hits) => {
+                    tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
+                }
+                Err(reason) => {
+                    tracing::warn!("⚠️  记忆层跳过（recall）: {}", reason);
+                    memory_used = false;
+                    memory_skip_reason = Some(reason);
+                }
             }
         }
 
@@ -193,11 +219,55 @@ pub async fn upload_single(
             tracing::info!("✅ 文档分类完成: {} ({}%)", c.doc_type, c.confidence);
         }
 
+        // 【A/B 测量面】只在 UPLOAD_EXTRACTION_DIGEST=true 时构造，默认不出现。
+        // 不含姓名/手机/邮箱：测量面不应扩大 PII 暴露。
+        let extraction_digest = if ab_enabled {
+            Some(ExtractionDigest {
+                memory_used,
+                memory_skip_reason: memory_skip_reason.clone(),
+                doc_type: processed
+                    .classification
+                    .as_ref()
+                    .map(|c| format!("{:?}", c.doc_type))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                category: format!("{:?}", processed.category),
+                classification_confidence: processed
+                    .classification
+                    .as_ref()
+                    .map(|c| c.confidence)
+                    .unwrap_or(0.0),
+                extraction_duration_ms: processed.extraction_duration_ms,
+                scoring_duration_ms: processed.scoring_duration_ms,
+                processing_time_ms: processed.processing_time_ms,
+                quality: QualityDigest {
+                    overall_score: processed.quality_score.overall_score,
+                    completeness: processed.quality_score.completeness,
+                    clarity: processed.quality_score.clarity,
+                    professionalism: processed.quality_score.professionalism,
+                },
+                skills: processed
+                    .extracted_info
+                    .skills
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect(),
+                skills_count: processed.extracted_info.skills.len(),
+                education_count: processed.extracted_info.education.len(),
+                work_count: processed.extracted_info.work_experience.len(),
+                extraction_confidence: processed.extraction_confidence,
+                quality_confidence: processed.quality_confidence,
+            })
+        } else {
+            None
+        };
+
         return Ok(ApiResponse::success_with_message(
             UploadRecordWithMemory {
                 record,
                 memory_used,
                 memory_skip_reason,
+                extraction_digest,
             },
             "上传成功并完成智能分类",
         ));
