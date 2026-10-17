@@ -77,17 +77,25 @@ async fn main() -> anyhow::Result<()> {
         .allow_headers(Any);
 
     // 构建路由
-    let app = Router::new()
-        .route("/health", get(health_check))
+    //
+    // ⚠️ `/health` 必须留在鉴权中间件**之外**：consul-client 的健康检查是
+    //    `GET http://127.0.0.1:{port}/health`，不带 Bearer。若被中间件拦成 401，
+    //    Consul 会在 30s 后把该服务判为 critical 并注销（同一主机部署同样会发生）。
+    //    用 `route_layer` 而非 `layer`：只包装已注册路由，不波及 fallback。
+    let protected = Router::new()
         // 需要JWT验证的路由
         .route("/profile", get(handlers::get_profile))
         .route("/profile", put(handlers::update_profile))
         .route("/avatar", put(handlers::upload_avatar))
         .route("/password", put(handlers::change_password))
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             jwt_middleware::auth_middleware,
-        ))
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .merge(protected)
         .layer(cors)
         .with_state(state);
 
