@@ -173,6 +173,13 @@ def aggregate(runs):
     return out
 
 
+def fmt_num(value):
+    """整数不显示 .0（78 而不是 78.0），小数保留原样。"""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def render_summary(agg, runs, args):
     lines = []
     lines.append("# A/B 基线（记忆注入前）")
@@ -203,7 +210,8 @@ def render_summary(agg, runs, args):
         delta = n["median"] - o["median"]
         noise = max(o["spread"], n["spread"])
         lines.append(
-            f"| `{label}` | {o['median']} | {n['median']} | {delta:+} | {noise} |"
+            f"| `{label}` | {fmt_num(o['median'])} | {fmt_num(n['median'])} "
+            f"| {'+' if delta else ''}{fmt_num(delta)} | {fmt_num(noise)} |"
         )
 
     lines.append("")
