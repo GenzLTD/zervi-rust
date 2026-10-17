@@ -107,6 +107,8 @@ pub async fn upload_single(
         // recall 结果渲染成的注入块。开关关闭 / 未命中 ⇒ None ⇒ prompt 与
         // 「没有记忆层」逐字节一致（A/B 对照组因此才有意义）。
         let mut memory_block: Option<String> = None;
+        // 实际注入的记忆 id（空 = 没注入），进 digest 供事后按 id 回查内容
+        let mut memory_injected_ids: Vec<String> = Vec::new();
         if ab_memory_off {
             // 对照组：跳过记忆，其余流程完全一致（同一进程、同一份预热模型）
             memory_used = false;
@@ -118,12 +120,15 @@ pub async fn upload_single(
                 Ok(hits) => {
                     tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
                     if state.config.memory_prompt_injection {
-                        let lines = memory_prompt::prepare_lines(
+                        let (lines, ids) = memory_prompt::prepare(
                             &hits,
                             state.config.memory_inject_max_hits,
                             state.config.memory_inject_hit_chars,
                         );
                         memory_block = memory_prompt::render_block(&lines);
+                        if memory_block.is_some() {
+                            memory_injected_ids = ids;
+                        }
                         tracing::info!(
                             "🧠 记忆注入: {}（可用 {} 条 / {} 字符）",
                             if memory_block.is_some() {
@@ -258,6 +263,9 @@ pub async fn upload_single(
                     .as_ref()
                     .map(|b| b.chars().count())
                     .unwrap_or(0),
+                // 注入了哪几条：recall 无阈值 ⇒ 「命中几条」不代表相关性，
+                // 留 id 才能事后回查「进 prompt 的是不是同类岗位」
+                memory_injected_ids: memory_injected_ids.clone(),
                 doc_type: processed
                     .classification
                     .as_ref()

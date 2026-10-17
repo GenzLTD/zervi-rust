@@ -76,26 +76,59 @@ pub fn hit_text(hit: &MemoryHit) -> Option<String> {
 /// 把命中整理成「可直接拼进 prompt 的若干行」。
 ///
 /// 每行都做：脱敏 → 折成单行（参考段自己的换行会打乱结构）→ 按字符截断。
-pub fn prepare_lines(hits: &[MemoryHit], max_hits: usize, max_chars: usize) -> Vec<String> {
+/// 取一条命中的 id（cortex-mcp 的记录键是 `id`）。
+///
+/// 为什么要 id 而不是只留文本：`recall` **没有相似度阈值** ——
+/// 非空库上必然返回 k 条，所以「命中几条」完全不能说明相关性。
+/// 只有把「这次到底注入了哪几条」记下来，事后才能按 id 回查内容，
+/// 判断 A/B 的 Δ 是「记忆有用」还是「preload 内容跑偏把模型带歪了」。
+pub fn hit_id(hit: &MemoryHit) -> Option<String> {
+    hit.get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// 准备注入行，**同时**返回这些行的来源 id（顺序与行一一对应）。
+pub fn prepare(
+    hits: &[MemoryHit],
+    max_hits: usize,
+    max_chars: usize,
+) -> (Vec<String>, Vec<String>) {
     let max_hits = max_hits.max(1);
     let max_chars = max_chars.max(1);
 
-    hits.iter()
-        .filter_map(hit_text)
-        .map(|raw| redact(&raw))
-        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            if s.chars().count() > max_chars {
-                let mut cut: String = s.chars().take(max_chars).collect();
-                cut.push('…');
-                cut
-            } else {
-                s
-            }
-        })
-        .take(max_hits)
-        .collect()
+    let mut lines = Vec::new();
+    let mut ids = Vec::new();
+
+    for hit in hits {
+        if lines.len() >= max_hits {
+            break;
+        }
+        let Some(raw) = hit_text(hit) else { continue };
+        let redacted = redact(&raw);
+        let normalized = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            continue;
+        }
+        let line = if normalized.chars().count() > max_chars {
+            let mut cut: String = normalized.chars().take(max_chars).collect();
+            cut.push('…');
+            cut
+        } else {
+            normalized
+        };
+        lines.push(line);
+        // id 缺失时用空串占位，保持 ids 与 lines 下标对齐
+        ids.push(hit_id(hit).unwrap_or_default());
+    }
+
+    (lines, ids)
+}
+
+/// 只要行、不要 id 的便捷包装（单测与旧调用点用）。
+pub fn prepare_lines(hits: &[MemoryHit], max_hits: usize, max_chars: usize) -> Vec<String> {
+    prepare(hits, max_hits, max_chars).0
 }
 
 /// 渲染注入段。`lines` 为空 ⇒ `None`（调用方据此走**原 prompt**，
@@ -192,6 +225,34 @@ mod tests {
     }
 
     /// 渲染段必须同时具备：边界标记、三条禁令、编号正文。
+    /// `prepare` 返回的 id 必须与行**下标一一对应**：空白条目被跳过时
+    /// 不能占位，缺 id 的条目要用空串占位（否则事后按 id 回查会错位）。
+    #[test]
+    fn prepare_keeps_ids_aligned_with_lines() {
+        use serde_json::json;
+        let hits = vec![
+            json!({"id": "m-1", "content": "甲"}),
+            json!({"content": "乙"}),              // 无 id ⇒ 空串占位
+            json!({"id": "m-3", "content": "   "}), // 空白 ⇒ 整条跳过
+            json!({"id": "m-4", "content": "丙"}),
+        ];
+        let (lines, ids) = prepare(&hits, 5, 300);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(ids, vec!["m-1".to_string(), String::new(), "m-4".to_string()]);
+    }
+
+    /// 截断到 max_hits 时，id 也要跟着截（否则 digest 里的 id 比正文多）。
+    #[test]
+    fn prepare_truncates_ids_with_lines() {
+        use serde_json::json;
+        let hits: Vec<_> = (1..=5)
+            .map(|i| json!({"id": format!("m-{i}"), "content": format!("第{i}条")}))
+            .collect();
+        let (lines, ids) = prepare(&hits, 2, 300);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(ids, vec!["m-1".to_string(), "m-2".to_string()]);
+    }
+
     #[test]
     fn block_carries_isolation_rules() {
         let block = render_block(&["技能：Rust、SQL".to_string()]).unwrap();

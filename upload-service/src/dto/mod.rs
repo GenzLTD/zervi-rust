@@ -57,6 +57,14 @@ pub struct ExtractionDigest {
     pub memory_injected: bool,
     /// 注入块字符数（0 = 未注入）。用来确认预算生效、以及为 token 成本留证据。
     pub memory_injected_chars: usize,
+    /// 这次**实际注入了哪几条记忆**（cortex-mcp 的记录 id，顺序即 prompt 里的顺序）。
+    ///
+    /// 为什么需要它：`recall` 没有相似度阈值 —— 库非空时必然返回 k 条，
+    /// 所以 `memory_injected=true` 只说明「有东西进了 prompt」，与「进的是不是
+    /// 同类岗位」无关。把 id 留下来，事后能按 id 回查内容，才分得清 A/B 的 Δ
+    /// 是「记忆有用」还是「preload 内容跑偏把模型带歪」。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_injected_ids: Vec<String>,
     /// `resume` / `job_description` / `poetry_profile` / `other`
     pub doc_type: String,
     /// 传统分类（`Resume` / `CoverLetter` / `Certificate` / `Other`）
@@ -206,6 +214,7 @@ mod tests {
             memory_skip_reason: None,
             memory_injected: true,
             memory_injected_chars: 512,
+            memory_injected_ids: vec!["m-1".into(), "m-2".into()],
             doc_type: "Resume".into(),
             category: "Resume".into(),
             classification_confidence: 0.93,
@@ -262,6 +271,7 @@ mod tests {
             "memory_used",
             "memory_injected",
             "memory_injected_chars",
+            "memory_injected_ids",
             "doc_type",
             "category",
             "classification_confidence",
