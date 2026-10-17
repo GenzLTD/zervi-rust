@@ -22,9 +22,11 @@ mod jwt_middleware;
 
 use config::Config;
 use services::{
-    deepseek_client::DeepSeekClient, document_processor::DocumentProcessor,
-    local_llm_client::LocalLLMClient, storage::LocalStorage,
+    deepseek_client::DeepSeekClient, document_processor::DocumentProcessor, storage::LocalStorage,
 };
+// 进程内 GGUF 推理客户端（仅 `--features local-llm` 时存在）
+#[cfg(feature = "local-llm")]
+use services::local_llm_client::LocalLLMClient;
 use utils::jwt::JwtService;
 
 #[derive(Clone)]
@@ -40,6 +42,66 @@ pub struct AppState {
 
 async fn health_check() -> &'static str {
     "Upload Service is healthy"
+}
+
+/// 进程外模型服务（Ollama 协议）→ DocumentProcessor
+///
+/// `DeepSeekClient` 打的是 `POST {DEEPSEEK_URL}/api/generate`，即 Ollama 原生协议，
+/// 默认 `DEEPSEEK_URL=http://localhost:11434` ⇒ 本机模型进程。不需要新的客户端。
+fn build_remote_processor(config: &Config) -> Arc<DocumentProcessor> {
+    tracing::info!(
+        "🌐 使用进程外模型服务（Ollama 协议）: {} ({})",
+        config.deepseek_url,
+        config.deepseek_model
+    );
+
+    let deepseek = DeepSeekClient::new(config.deepseek_url.clone(), config.deepseek_model.clone());
+
+    Arc::new(DocumentProcessor::new(
+        deepseek,
+        config.pyresparser_url.clone(),
+        config.paddleocr_url.clone(),
+        config.mineru_url.clone(),
+        config.enable_pyresparser,
+        true, // enable_ocr - 启用OCR自动增强
+        config.enable_mineru,
+    ))
+}
+
+/// 进程内 GGUF（需 `--features local-llm`）
+#[cfg(feature = "local-llm")]
+fn build_local_processor(config: &Config) -> anyhow::Result<Arc<DocumentProcessor>> {
+    tracing::info!("🔒 使用本地 LLM（自主可控模式）");
+
+    let local_llm = LocalLLMClient::new(
+        &config.local_llm_model_path,
+        Some(config.local_llm_context_size),
+        config.local_llm_n_threads,
+    )
+    .map_err(|e| {
+        tracing::error!("❌ 本地 LLM 初始化失败: {}", e);
+        anyhow::anyhow!("本地 LLM 初始化失败: {}", e)
+    })?;
+
+    Ok(Arc::new(DocumentProcessor::new_with_local_llm(
+        local_llm,
+        config.pyresparser_url.clone(),
+        config.paddleocr_url.clone(),
+        config.mineru_url.clone(),
+        config.enable_pyresparser,
+        true, // enable_ocr - 启用OCR自动增强
+        config.enable_mineru,
+    )))
+}
+
+/// 未编译 `local-llm` 时的兜底：显式拒绝，而不是静默降级到进程外
+#[cfg(not(feature = "local-llm"))]
+fn build_local_processor(_config: &Config) -> anyhow::Result<Arc<DocumentProcessor>> {
+    anyhow::bail!(
+        "USE_LOCAL_LLM=true，但本二进制未编译 `local-llm` feature（进程内 GGUF 不在本轮范围）。\
+         请改用进程外模型服务：设 USE_LOCAL_LLM=false，并把 DEEPSEEK_URL 指向本机模型进程\
+         （默认 http://localhost:11434）。"
+    )
 }
 
 #[tokio::main]
@@ -84,45 +146,14 @@ async fn main() -> anyhow::Result<()> {
     let jwt_service = JwtService::new(config.jwt_secret.clone(), config.jwt_expiration);
 
     // 初始化文档处理器（智能路由系统）
+    //
+    //  进程外（默认）—— `USE_LOCAL_LLM=false`：DeepSeekClient 打 `POST {DEEPSEEK_URL}/api/generate`，
+    //      即 Ollama 协议，指向本机模型进程（默认 http://localhost:11434）。
+    //  进程内 —— `USE_LOCAL_LLM=true`：需以 `--features local-llm` 构建（本轮不编译）。
     let processor = if config.use_local_llm {
-        // 使用本地 LLM（自主可控）
-        tracing::info!("🔒 使用本地 LLM（自主可控模式）");
-
-        let local_llm = LocalLLMClient::new(
-            &config.local_llm_model_path,
-            Some(config.local_llm_context_size),
-            config.local_llm_n_threads,
-        )
-        .map_err(|e| {
-            tracing::error!("❌ 本地 LLM 初始化失败: {}", e);
-            anyhow::anyhow!("本地 LLM 初始化失败: {}", e)
-        })?;
-
-        Arc::new(DocumentProcessor::new_with_local_llm(
-            local_llm,
-            config.pyresparser_url.clone(),
-            config.paddleocr_url.clone(),
-            config.mineru_url.clone(),
-            config.enable_pyresparser,
-            true, // enable_ocr - 启用OCR自动增强
-            config.enable_mineru,
-        ))
+        build_local_processor(&config)?
     } else {
-        // 使用远程 DeepSeek API（原有方式）
-        tracing::info!("🌐 使用远程 DeepSeek API");
-
-        let deepseek =
-            DeepSeekClient::new(config.deepseek_url.clone(), config.deepseek_model.clone());
-
-        Arc::new(DocumentProcessor::new(
-            deepseek,
-            config.pyresparser_url.clone(),
-            config.paddleocr_url.clone(),
-            config.mineru_url.clone(),
-            config.enable_pyresparser,
-            true, // enable_ocr - 启用OCR自动增强
-            config.enable_mineru,
-        ))
+        build_remote_processor(&config)
     };
 
     tracing::info!("✅ Document processor initialized (智能路由系统)");

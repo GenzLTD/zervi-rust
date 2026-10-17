@@ -10,12 +10,15 @@ use super::{
     document_router::DocumentRouter,
     jd_parser::{JDParser, JobDescription},
     llm_trait::LLMClient,
-    local_llm_client::LocalLLMClient,
     mineru_client::MinerUClient,
     paddleocr_client::PaddleOCRClient,
     pdf_parser::PdfParser,
     pyresparser_client::PyResParserClient,
 };
+
+// 进程内 GGUF 推理客户端（仅 `--features local-llm` 时存在）
+#[cfg(feature = "local-llm")]
+use super::local_llm_client::LocalLLMClient;
 
 #[derive(Clone)]
 pub struct DocumentProcessor {
@@ -64,6 +67,8 @@ impl DocumentProcessor {
     }
 
     /// 使用本地 LLM 创建 DocumentProcessor
+    /// （进程内 GGUF 仅在 `--features local-llm` 时可用）
+    #[cfg(feature = "local-llm")]
     pub fn new_with_local_llm(
         local_llm: LocalLLMClient,
         pyresparser_url: String,

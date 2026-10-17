@@ -81,9 +81,19 @@ validator = { version = "0.16", features = ["derive"] }
 regex = "1.10"
 lazy_static = "1.4"
 
-# 本地 LLM 推理（自主可控）
-# 注意：llama_cpp_rs 需要编译 C++ 代码，可能需要较长时间
-llama_cpp_rs = "0.3"
-num_cpus = "1.16"
-rand = "0.8"
+# LLM 抽象层（进程内 / 进程外 统一接口）
 async-trait = "0.1"
+
+# 本地 LLM 推理（进程内 GGUF，自主可控）
+# ⚠️ 改为 optional feature `local-llm`，默认关闭 ——
+#    llama_cpp_rs 0.3 的 build.rs 用 bindgen ⇒ 构建期必需 libclang（Windows 亦然，
+#    且其 windows 分支不分 gnu/msvc、硬推 MSVC 旗标）。
+#    默认关闭后本包与其 C++ 链接解绑，进程外模型服务（Ollama 协议）分支可单独编出二进制。
+llama_cpp_rs = { version = "0.3", optional = true }
+num_cpus = { version = "1.16", optional = true }
+rand = "0.8"
+
+[features]
+default = []
+# 启用进程内 GGUF 推理（需 libclang；本轮不编译）
+local-llm = ["dep:llama_cpp_rs", "dep:num_cpus"]

@@ -6,6 +6,8 @@ pub mod document_processor;
 pub mod document_router;
 pub mod jd_parser;
 pub mod llm_trait;
+// 进程内 GGUF 推理：仅 `--features local-llm` 时编译（需 libclang）
+#[cfg(feature = "local-llm")]
 pub mod local_llm_client;
 pub mod mineru_client;
 pub mod paddleocr_client;

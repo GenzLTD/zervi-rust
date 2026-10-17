@@ -51,6 +51,8 @@ impl LLMClient for crate::services::deepseek_client::DeepSeekClient {
 }
 
 // 为 LocalLLMClient 实现 LLMClient trait
+// （进程内 GGUF 仅在 `--features local-llm` 时存在）
+#[cfg(feature = "local-llm")]
 #[async_trait::async_trait]
 impl LLMClient for crate::services::local_llm_client::LocalLLMClient {
     async fn extract_resume_info(
