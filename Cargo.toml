@@ -13,6 +13,7 @@ members = [
     "shared/common",
     "shared/consul-client",
     "shared/service-auth",  # 服务间认证库
+    "shared/mcp-client",    # 终端侧 MCP 客户端（托管 cortex-mcp 记忆层，stdio 子进程）
 ]
 resolver = "2"
 

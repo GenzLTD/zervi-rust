@@ -1,0 +1,29 @@
+[package]
+name = "mcp-client"
+version.workspace = true
+edition.workspace = true
+description = "终端侧 MCP 客户端：以 stdio 子进程托管 cortex-mcp 记忆层"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# MCP 官方 Rust SDK（crates.io 已独立核实：3.5.1 / MSRV 1.88）
+#
+# ⚠️ 为什么 default-features = false：
+#    rmcp 的 default = ["base64", "macros", "server"]，默认带的是 **服务端** 栈
+#    （server 会额外拉 schemars + pastey + uuid）。终端侧只做 client，
+#    关掉默认可以少编一整套服务端代码。
+#
+# ⚠️ 为什么必须显式开 client：`client` 不在 default 里（只加 tokio-stream）。
+# ⚠️ transport-child-process 才是 stdio 子进程传输，它会带进 process-wrap 10.x
+#    （v10 之后构造入口从裸 tokio::process::Command 改为 CommandWrap，
+#     rmcp 已提供 `impl Into<CommandWrap>` 的兼容转换，用法仍是
+#    `TokioChildProcess::new(Command::new(..).configure(..))`）。
+rmcp = { version = "3.5.1", default-features = false, features = [
+    "client",
+    "transport-child-process",
+] }
