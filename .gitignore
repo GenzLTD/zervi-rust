@@ -27,6 +27,10 @@ Thumbs.db
 temp_uploads/
 uploads/
 
+# A/B 基线运行产物（tools/ab_memory_baseline.py 默认输出 ab-results/<时间戳>/）
+# 里面是逐轮 runs.json / summary.md，含真实上传的 digest，属运行结果不属于源码
+ab-results/
+
 # 环境变量
 .env
 .env.local
