@@ -16,6 +16,8 @@ pub mod paddleocr_client;
 pub mod pdf_parser;
 pub mod pyresparser_client;
 pub mod resume_optimizer;
+// 模型输出的 null 兼容（显式 null → Default）
+pub mod serde_util;
 pub mod storage;
 pub mod upload_service;
 

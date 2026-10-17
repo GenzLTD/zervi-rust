@@ -27,10 +27,11 @@ impl ResumeOptimizer {
         let prompt = Self::build_optimization_prompt(original, ats_analysis, &config);
 
         let request = super::deepseek_client::OllamaRequest {
-            model: "deepseek-r1:7b".to_string(),
+            model: self.deepseek.model.clone(),
             prompt,
             stream: false,
             format: Some("json".to_string()),
+            options: self.deepseek.request_options(),
         };
 
         let response = self

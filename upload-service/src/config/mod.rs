@@ -37,6 +37,13 @@ pub struct Config {
     // 单跳提取实测 336.1s、`upload_single` 顺序发两跳（第一跳 220.52s）⇒ 300s
     // 必然超时。原「300s」既不成立也不可调，所以提为 env。
     pub llm_http_timeout_secs: u64,
+    // 采样参数（决定「可复现性」）
+    //
+    // `/upload` 是提取任务：同一份文件必须给同一份结果。Ollama 默认
+    // temperature=0.8 + 随机种子 ⇒ 实测同一文件两次提取 skills_count 差 3，
+    // A/B 还没接注入就已经「差 ≠ 0」，仪器不合格。
+    pub llm_temperature: f32,
+    pub llm_seed: i64,
     // 记忆层（cortex-mcp，作为 stdio 子进程随终端起停）
     pub mcp_enabled: bool,
     pub mcp_python: String,
@@ -150,6 +157,16 @@ impl Config {
                 .unwrap_or_else(|_| "900".to_string())
                 .parse()
                 .expect("LLM_HTTP_TIMEOUT_SECS must be a number"),
+            // 默认 temperature=0 / seed=42：先可复现，再谈优化。
+            llm_temperature: env::var("LLM_TEMPERATURE")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| (0.0..=2.0).contains(v))
+                .unwrap_or(0.0),
+            llm_seed: env::var("LLM_SEED")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(42),
             // 记忆层：默认关闭（opt-in）。启用后连不上只降级、不影响主链路。
             mcp_enabled: env::var("MCP_ENABLED")
                 .unwrap_or_else(|_| "false".to_string())

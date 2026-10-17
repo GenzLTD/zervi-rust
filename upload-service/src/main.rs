@@ -58,10 +58,12 @@ fn build_remote_processor(config: &Config) -> Arc<DocumentProcessor> {
         config.deepseek_model
     );
 
-    let deepseek = DeepSeekClient::with_timeout(
+    let deepseek = DeepSeekClient::with_params(
         config.deepseek_url.clone(),
         config.deepseek_model.clone(),
         config.llm_http_timeout_secs,
+        config.llm_temperature,
+        config.llm_seed,
     );
 
     Arc::new(DocumentProcessor::new(
@@ -225,6 +227,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         "   - LLM HTTP 超时: {}s（LLM_HTTP_TIMEOUT_SECS）",
         config.llm_http_timeout_secs
+    );
+    tracing::info!(
+        "   - LLM 采样: temperature={} seed={}（LLM_TEMPERATURE / LLM_SEED）",
+        config.llm_temperature,
+        config.llm_seed
     );
 
     // 创建应用状态

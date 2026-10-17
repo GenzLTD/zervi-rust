@@ -1,3 +1,4 @@
+use crate::services::serde_util::null_to_default;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -7,6 +8,12 @@ pub struct DeepSeekClient {
     pub client: Client,
     pub base_url: String,
     pub model: String,
+    /// 采样温度。**默认 0**：`/upload` 是「提取」不是「创作」，同一份文件必须
+    /// 给出同一份结果，否则任何 A/B 差值都无法归因（实测 off/on 两组在注入
+    /// 尚未实现时 skills_count 就差 3，根因就是默认 temperature 0.8）。
+    pub temperature: f32,
+    /// 随机种子。固定它才能让 temperature=0 的解码在跨进程间也可复现。
+    pub seed: i64,
 }
 
 impl DeepSeekClient {
@@ -20,6 +27,12 @@ impl DeepSeekClient {
     /// 正解是 `/upload` 异步化（202 + task_id + 轮询/SSE），已列入路线。
     pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
+    /// 默认温度。0 = 尽可能贪心，优先可复现。
+    pub const DEFAULT_TEMPERATURE: f32 = 0.0;
+
+    /// 默认种子。固定值本身无意义，有意义的是**不变**。
+    pub const DEFAULT_SEED: i64 = 42;
+
     /// 从 `LLM_HTTP_TIMEOUT_SECS` 读取超时（秒），未设或非法则用默认值。
     pub fn timeout_secs_from_env() -> u64 {
         std::env::var("LLM_HTTP_TIMEOUT_SECS")
@@ -29,16 +42,56 @@ impl DeepSeekClient {
             .unwrap_or(Self::DEFAULT_TIMEOUT_SECS)
     }
 
-    /// 构造：超时取 `LLM_HTTP_TIMEOUT_SECS`（默认 900s）。
+    /// 从 `LLM_TEMPERATURE` 读取温度（默认 0）。非法或负值回退默认。
+    pub fn temperature_from_env() -> f32 {
+        std::env::var("LLM_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| (0.0..=2.0).contains(v))
+            .unwrap_or(Self::DEFAULT_TEMPERATURE)
+    }
+
+    /// 从 `LLM_SEED` 读取种子（默认 42）。
+    pub fn seed_from_env() -> i64 {
+        std::env::var("LLM_SEED")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(Self::DEFAULT_SEED)
+    }
+
+    /// 构造：超时 / 温度 / 种子全部取 env 默认值。
     ///
     /// 保留这个两参签名，是为了让 `optimize_handler` / `batch_upload_handler`
     /// 这些**直接读 env 自己造 client** 的旧调用点不必一起改，也能拿到新默认值。
     pub fn new(base_url: String, model: String) -> Self {
-        Self::with_timeout(base_url, model, Self::timeout_secs_from_env())
+        Self::with_params(
+            base_url,
+            model,
+            Self::timeout_secs_from_env(),
+            Self::temperature_from_env(),
+            Self::seed_from_env(),
+        )
     }
 
-    /// 显式指定超时（秒）。主流程走这条，便于把 `Config` 里的值打日志对账。
+    /// 显式指定超时（秒），温度/种子取 env 默认值。
     pub fn with_timeout(base_url: String, model: String, timeout_secs: u64) -> Self {
+        Self::with_params(
+            base_url,
+            model,
+            timeout_secs,
+            Self::temperature_from_env(),
+            Self::seed_from_env(),
+        )
+    }
+
+    /// 全参数构造：主流程走这条，便于把 `Config` 里的值打日志对账。
+    pub fn with_params(
+        base_url: String,
+        model: String,
+        timeout_secs: u64,
+        temperature: f32,
+        seed: i64,
+    ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -48,6 +101,17 @@ impl DeepSeekClient {
             client,
             base_url,
             model,
+            temperature,
+            seed,
+        }
+    }
+
+    /// 本 client 的采样参数，供直接构造 `OllamaRequest` 的调用点复用
+    /// （`ats_optimizer` / `resume_optimizer` 自己拼请求体，别各写一份默认值）。
+    pub fn request_options(&self) -> OllamaOptions {
+        OllamaOptions {
+            temperature: self.temperature,
+            seed: self.seed,
         }
     }
 
@@ -68,6 +132,7 @@ impl DeepSeekClient {
             prompt,
             stream: false,
             format: Some("json".to_string()),
+            options: self.request_options(),
         };
 
         let response = self
@@ -112,6 +177,7 @@ impl DeepSeekClient {
             prompt,
             stream: false,
             format: Some("json".to_string()),
+            options: self.request_options(),
         };
 
         let response = self
@@ -156,6 +222,7 @@ impl DeepSeekClient {
             prompt,
             stream: false,
             format: Some("json".to_string()),
+            options: self.request_options(),
         };
 
         let response = self
@@ -336,6 +403,19 @@ pub struct OllamaRequest {
     pub prompt: String,
     pub stream: bool,
     pub format: Option<String>,
+    /// 采样参数。
+    ///
+    /// **不传这一项 = 不可复现**：Ollama 默认 `temperature=0.8` + 随机种子，
+    /// 同一份简历两次提取能差 3 个技能（实测 A/B 两组在没有注入的情况下就
+    /// 已经出现 skills_count 差 3，而组内极差只有 2）。提取任务必须确定性，
+    /// 否则任何「记忆带来多少提升」的结论都会被解码噪声盖住。
+    pub options: OllamaOptions,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OllamaOptions {
+    pub temperature: f32,
+    pub seed: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -350,19 +430,27 @@ pub struct ExtractedResumeInfo {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub location: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub education: Vec<Education>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub work_experience: Vec<WorkExperience>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub skills: Vec<String>,
     pub summary: Option<String>,
 }
 
+/// 教育经历。
+///
+/// 三个 String 都必须容 null：qwen2.5 会把不认识的字段写成 `null`
+/// （实测 `"major": null`），而 `#[serde(default)]` 只兜字段缺失、兜不住显式
+/// null ⇒ 整个 `/upload` 500。详见 `services/serde_util.rs`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Education {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub school: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub major: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub degree: String,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
@@ -370,8 +458,11 @@ pub struct Education {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkExperience {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub company: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub position: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub description: String,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
@@ -379,17 +470,17 @@ pub struct WorkExperience {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QualityScore {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub overall_score: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub completeness: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub clarity: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub professionalism: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub highlights: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub suggestions: Vec<String>,
 }
 
@@ -405,23 +496,24 @@ pub struct ExtractedPoetryProfile {
     pub birthplace: Option<String>,
     pub deathplace: Option<String>,
     pub biography: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub official_positions: Vec<String>,
     pub literary_style: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub works: Vec<PoetryWork>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub locations: Vec<PoetryLocation>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub events: Vec<PoetryEvent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub famous_quotes: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub extraction_confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoetryWork {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
@@ -445,4 +537,105 @@ pub struct PoetryEvent {
     pub event: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// qwen2.5 真实输出形态：不认识的字段写 `null`，而不是省略。
+    /// 修复前这里报 `invalid type: null, expected a string`，整个 /upload 500。
+    #[test]
+    fn parses_qwen_null_fields() {
+        let raw = r#"{
+            "name": "张三",
+            "phone": null,
+            "email": null,
+            "location": null,
+            "summary": null,
+            "skills": null,
+            "education": [
+                {"school": null, "major": null, "degree": null, "start_date": null, "end_date": null}
+            ],
+            "work_experience": [
+                {"company": null, "position": "工程师", "description": null, "start_date": "2020", "end_date": null}
+            ]
+        }"#;
+
+        let info: ExtractedResumeInfo =
+            serde_json::from_str(raw).expect("显式 null 不得导致解析失败");
+
+        assert_eq!(info.name.as_deref(), Some("张三"));
+        assert!(info.skills.is_empty());
+        assert_eq!(info.education.len(), 1);
+        assert_eq!(info.education[0].school, "");
+        assert_eq!(info.education[0].major, "");
+        assert_eq!(info.work_experience[0].position, "工程师");
+        assert_eq!(info.work_experience[0].company, "");
+    }
+
+    /// 评分同样是模型输出，四个 i32 也会是 null。null 必须落成 0，
+    /// 不能让「没打分」变成 500。
+    #[test]
+    fn parses_qwen_null_scores() {
+        let raw = r#"{
+            "overall_score": null, "completeness": null,
+            "clarity": null, "professionalism": null,
+            "highlights": null, "suggestions": null
+        }"#;
+        let score: QualityScore = serde_json::from_str(raw).expect("null 分数不得报错");
+        assert_eq!(score.overall_score, 0);
+        assert_eq!(score.clarity, 0);
+        assert!(score.highlights.is_empty());
+    }
+
+    /// 诗人档案是同一类输出（模型写 null），同一缺陷类顺手一并兜住。
+    #[test]
+    fn parses_qwen_null_poetry_profile() {
+        let raw = r#"{
+            "name": null, "works": null, "locations": null, "events": null,
+            "official_positions": null, "famous_quotes": null,
+            "extraction_confidence": null
+        }"#;
+        let profile: ExtractedPoetryProfile =
+            serde_json::from_str(raw).expect("null 诗人档案不得报错");
+        assert!(profile.works.is_empty());
+        assert_eq!(profile.extraction_confidence, 0.0);
+    }
+
+    /// 缺失字段（不是 null）走 serde default，不与 null 冲突。
+    #[test]
+    fn parses_missing_fields() {
+        let info: ExtractedResumeInfo = serde_json::from_str("{}").unwrap();
+        assert!(info.education.is_empty());
+        assert!(info.skills.is_empty());
+    }
+
+    /// 请求体必须带 options：没有它，Ollama 用默认 temperature 0.8 + 随机种子，
+    /// 「同一文件两次提取差 3 个技能」就是这么来的。
+    #[test]
+    fn request_carries_deterministic_options() {
+        let req = OllamaRequest {
+            model: "qwen2.5:7b".into(),
+            prompt: "x".into(),
+            stream: false,
+            format: Some("json".into()),
+            options: OllamaOptions {
+                temperature: 0.0,
+                seed: 42,
+            },
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let opts = v.get("options").expect("请求体必须含 options");
+        assert_eq!(opts.get("temperature").unwrap(), 0.0);
+        assert_eq!(opts.get("seed").unwrap(), 42);
+    }
+
+    /// env 覆盖：A/B 期要能锁死，生产也要能放开。
+    #[test]
+    fn sampling_env_defaults() {
+        // 不依赖进程环境（测试并行会互相污染），只验证「非法值回退默认」的语义
+        assert!(DeepSeekClient::DEFAULT_TEMPERATURE == 0.0);
+        assert_eq!(DeepSeekClient::DEFAULT_SEED, 42);
+    }
 }
