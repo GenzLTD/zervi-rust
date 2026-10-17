@@ -535,6 +535,14 @@ mod tests {
         assert!(body.get("x-user-id").is_some(), "稳定主键必有");
         assert_eq!(body.get("x-user-tier").and_then(|v| v.as_str()), Some("pro"));
         assert!(body.get("x-user-email-hash").is_none(), "无 email 时不得注入");
+        assert_eq!(
+            body.get("x-actor-sub").and_then(|v| v.as_str()),
+            Some("s1"),
+            "X-Actor-Sub 必须是原始 sub"
+        );
+        let uid = body.get("x-user-id").and_then(|v| v.as_str()).unwrap_or("");
+        assert_ne!(uid, "s1", "X-User-Id 仍是 sha256(sub)，不改成原始 sub");
+        assert_eq!(uid.len(), 64);
     }
 
     /// 有 email ⇒ 注入跨端关联键。
@@ -606,6 +614,72 @@ mod tests {
             Some("FORGED-ID"),
             "客户端伪造的 Id 必须被覆盖"
         );
+    }
+
+    /// 客户端自带的 `X-Actor-Sub` 必须被换成 token 里的原始 sub。
+    /// 放行伪造值等于允许用别人的 sub 读 memory.recall。
+    #[tokio::test]
+    async fn ask_replaces_client_supplied_actor_sub() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("GATEWAY_JWT_SECRET", HS_SECRET);
+        std::env::remove_var("GATEWAY_JWKS_URL");
+
+        let upstream = spawn(echo_router()).await;
+        std::env::set_var("TATHA_BASE_URL", &upstream);
+        std::env::set_var("TATHA_SERVICE_TOKEN", "svc-test");
+
+        let gw = spawn(app()).await;
+        let body: Value = reqwest::Client::new()
+            .post(format!("{}/v1/ask", gw))
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    hs_token("  user-win-001  ", None, Some("free"), 3600)
+                ),
+            )
+            .header("X-Actor-Sub", "forged-other-sub")
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body.get("x-actor-sub").and_then(|v| v.as_str()),
+            Some("user-win-001")
+        );
+        assert_ne!(
+            body.get("x-user-id").and_then(|v| v.as_str()),
+            Some("user-win-001")
+        );
+    }
+
+    /// 空白 sub 不能转发：下游会把缺头当成 401，同时可能已经扣过配额。
+    #[tokio::test]
+    async fn ask_rejects_blank_sub_without_forwarding() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("GATEWAY_JWT_SECRET", HS_SECRET);
+        std::env::remove_var("GATEWAY_JWKS_URL");
+
+        let upstream = spawn(echo_router()).await;
+        std::env::set_var("TATHA_BASE_URL", &upstream);
+        std::env::set_var("TATHA_SERVICE_TOKEN", "svc-test");
+
+        let gw = spawn(app()).await;
+        let r = reqwest::Client::new()
+            .post(format!("{}/v1/ask", gw))
+            .header(
+                "authorization",
+                format!("Bearer {}", hs_token("   ", None, None, 3600)),
+            )
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
     }
 
     /// ES256（Supabase 原生形态）：mock JWKS + 本地 P-256 密钥端到端验证。
