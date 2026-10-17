@@ -81,8 +81,8 @@ pub async fn upload_single(
         //
         // 失败语义（已拍定）：**跳过记忆继续**，不阻断主链路。用户看不到服务端
         // 日志，所以跳过原因必须进响应体（memory_skip_reason）。
-        // 超时上限由 MCP_RECALL_TIMEOUT_MS 控制（默认 5s），保证冷启动时记忆层
-        // 不会把 /upload 拖得更久。
+        // 超时上限由 MCP_RECALL_TIMEOUT_MS 控制（默认 2s，真机标定：最坏 ≈0.7s），
+        // 保证记忆层不会把 /upload 拖得更久。
         let recall_query = format!("{} 简历 优化 历史反馈 目标岗位", file_name);
         let mut memory_skip_reason: Option<String> = None;
         let mut memory_used = true;

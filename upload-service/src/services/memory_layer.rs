@@ -56,6 +56,14 @@ impl MemoryLayer {
         }
         if let Some(dsn) = &config.cortex_database_url {
             spec = spec.with_env("CORTEX_DATABASE_URL", dsn.clone());
+        } else {
+            // 不阻断（有人可能直接改过 cortex-mcp 自己的 config.py），但必须喊出来：
+            // 它的默认值是 `postgresql://localhost:5432/cortex` —— 端口错 + 宿主字面量
+            // 走 ::1 + 无密码，三个坑叠在一起，真机上表现为 remember 静默超时。
+            tracing::warn!(
+                "⚠️  CORTEX_DATABASE_URL 未设置：cortex-mcp 将使用自身默认 DSN\
+                 （5432 / localhost→::1 / 无密码）—— 落库几乎必失败，请核对 .env.example"
+            );
         }
 
         let connect_timeout = Duration::from_millis(config.mcp_connect_timeout_ms);

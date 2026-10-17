@@ -159,10 +159,14 @@ impl Config {
                 .unwrap_or_else(|_| "20000".to_string())
                 .parse()
                 .unwrap_or(20_000),
+            // recall 超时上限。默认 2000ms 来自真机标定（Mac / 真库 5433 /
+            // nomic-embed-text）：recall 端到端热 59–72ms、冷 59ms，embedding
+            // 模型冷加载单独 0.65s ⇒ 最坏 ≈ 0.7s，2000ms 有约 3× 余量。
+            // 不建议低于 1000ms：一次冷加载就会贴着上限打满。
             mcp_recall_timeout_ms: env::var("MCP_RECALL_TIMEOUT_MS")
-                .unwrap_or_else(|_| "5000".to_string())
+                .unwrap_or_else(|_| "2000".to_string())
                 .parse()
-                .unwrap_or(5_000),
+                .unwrap_or(2_000),
             mcp_write_timeout_ms: env::var("MCP_WRITE_TIMEOUT_MS")
                 .unwrap_or_else(|_| "15000".to_string())
                 .parse()

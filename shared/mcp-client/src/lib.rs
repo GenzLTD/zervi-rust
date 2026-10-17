@@ -208,10 +208,14 @@ pub async fn probe_handshake(spec: &McpServerSpec, lifecycle: Lifecycle) -> Resu
 
 /// 单次 `recall` 的默认超时上限。
 ///
-/// 为什么必须有上限：终端机冷启动时 cortex-mcp 要现拉 Python 进程 + 连 PG +
-/// 让 Ollama 加载 embedding 模型，`recall` 可能长时间不返回。`/upload` 是同步
-/// HTTP 请求，记忆层不能把它拖得更久 —— 宁可 5s 后跳过记忆。
-pub const DEFAULT_RECALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// 必须有上限：`recall` 要走 embedding，`/upload` 是同步 HTTP，记忆层不能把它
+/// 拖得更久 —— 宁可超时后跳过记忆（响应体带 `memory_skip_reason`）。
+///
+/// **取值来自真机标定**，不是拍的：Mac / 真库 5433 / nomic-embed-text(274MB)
+/// 实测 recall 端到端 热 59–72ms、冷 59ms；embedding 模型冷加载单独测 0.65s
+/// （`keep_alive:0` 卸载后重测，排除缓存假象）⇒ 最坏 ≈ 0.65s + SQL 10ms ≈ 0.7s。
+/// 2s ≈ 3× 余量，是「本地模型」这一档的合理上界；不建议低于 1s。
+pub const DEFAULT_RECALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 单次写操作（`remember` / `forget` / `consolidate`）的默认超时上限。
 /// 写比读宽松：写要算 embedding，且丢了要重来。
