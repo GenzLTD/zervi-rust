@@ -233,6 +233,18 @@ def aggregate(runs):
         stats["memory_injected_chars_median"] = (
             statistics.median(chars) if chars else 0
         )
+        # 注入的是**哪几条**。on 组每轮都 reset + 灌同一批 preload，id 集合理应恒定；
+        # 出现多组说明 recall 的上下文在漂，此时 Δ 无法归因，先修流程再谈收益。
+        #
+        # 但别把「多组」直接判成流程坏了：rank 是 1/名次 加和，**不同行同分是常态**
+        # （vec 第 3 名 = fts 第 3 名 = 都 0.3333），k 又常切在并列边界上 ⇒ PG 的
+        # ORDER BY 对同分不保证顺序，顺序（甚至集合）都可能合法地变。
+        id_sets = [
+            tuple(r["digest"].get("memory_injected_ids") or []) for r in rows
+        ]
+        id_sets = [s for s in id_sets if s]  # 没注入的轮不参与比较
+        stats["memory_injected_id_sets"] = len(set(id_sets))
+        stats["memory_injected_ids_stable"] = len(set(id_sets)) <= 1
         out[arm] = {"n": len(rows), "stats": stats}
     return out
 
@@ -323,6 +335,22 @@ def render_summary(agg, runs, args):
             "  - ❗ 一轮都没注入：检查服务端 `MEMORY_PROMPT_INJECTION=true`，"
             "以及 recall 是否命中（`🧠 记忆注入: 已注入` 日志）。"
         )
+
+    # 注入可归因：跨轮 id 集合恒定，才谈得上「Δ 来自记忆」而不是「来自换了参考段」
+    id_set_count = on["stats"].get("memory_injected_id_sets")
+    if injected_runs and isinstance(id_set_count, int):
+        if id_set_count <= 1:
+            lines.append(
+                f"- 注入 id 集合：{injected_runs} 轮里恒定 1 组 ✓（reset + 固定 preload 生效，"
+                "参考段可复现）"
+            )
+        else:
+            lines.append(
+                f"- ⚠️ 注入 id 集合：{injected_runs} 轮里出现 **{id_set_count} 组**不同取值 "
+                "⇒ 先别谈 Δ。按序查：① reset/preload 是否每轮都真跑了 "
+                "② recall query 是否含时间戳/随机字段 ③ embedding 模型是否被换过。"
+                "（纯顺序变化可能只是同分并列，见 `aggregate()` 注释）"
+            )
 
     os_row = off["stats"].get("quality.overall_score")
     ns_row = on["stats"].get("quality.overall_score")

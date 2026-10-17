@@ -26,7 +26,14 @@
 //! 或用 `--require-topics` 断言。这一层不能省：注入阶段 `memory_injected`
 //! 必定为 true，preload 内容跑偏时 Δ 无法归因到「记忆有用」。
 //!
-//! 退出码：0 = 全部写入成功；1 = 有失败（含 denied / 超时）；2 = 参数或文件问题。
+//! 退出码：
+//! - `0` 全部写入成功，且所有闸门都过了（没配闸门 = 没有闸门要过）；
+//! - `1` 有失败（含 denied / 超时 / recall 报错）；
+//! - `2` 参数或文件问题（含「闸门配了却没配 `--verify-query`」——见下）；
+//! - `3` **写得不对**：写入本身成功，但内容没通过闸门（缺主题词 / 出现禁用词）。
+//!
+//! 退出码 3 的单独立项不是洁癖：hook 里 `if seed; then run ab; fi` 只看得到
+//! 成功/失败，分不清「没写进去」（1）和「写进去了但不是同类岗位」（3）。
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -44,6 +51,7 @@ struct Args {
     env: Vec<(String, String)>,
     verify_query: Option<String>,
     require_topics: Option<String>,
+    forbid_strings: Option<String>,
     verify_only: bool,
     dry_run: bool,
     write_timeout_ms: u64,
@@ -62,6 +70,7 @@ impl Args {
             env: Vec::new(),
             verify_query: None,
             require_topics: None,
+            forbid_strings: None,
             verify_only: false,
             dry_run: false,
             write_timeout_ms: mcp_client::DEFAULT_WRITE_TIMEOUT.as_millis() as u64,
@@ -81,6 +90,7 @@ impl Args {
                 "--text" => a.texts.push(val()?),
                 "--verify-query" => a.verify_query = Some(val()?),
                 "--require-topics" => a.require_topics = Some(val()?),
+                "--forbid-strings" => a.forbid_strings = Some(val()?),
                 "--verify-only" => a.verify_only = true,
                 "--write-timeout-ms" => {
                     a.write_timeout_ms = val()?.parse().map_err(|_| "需为数字")?
@@ -125,6 +135,55 @@ impl Args {
     }
 }
 
+/// 逗号分隔的闸门词表。
+///
+/// 返回 `Err` 表示**参数写错了**，与「内容不匹配」严格分开：`--require-topics ",,"`
+/// 以前会让词表为空 ⇒ 匹配必然为空 ⇒ exit 3 +「preload 内容与本次岗位不匹配」，
+/// 报的却是一条根本不存在的故障。参数错就该 exit 2。
+fn parse_gate_list(raw: &str) -> Result<Vec<String>, String> {
+    let terms: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if terms.is_empty() {
+        return Err(format!("闸门词表为空（收到 {raw:?}），至少给一个词"));
+    }
+    Ok(terms)
+}
+
+/// 从一条命中里取出可读文本。
+///
+/// cortex-mcp 现在返回 `content`，但返回形状不由我们控制（upload-service 侧的
+/// `hit_text` 也是按常见键名逐个试）。闸门如果只认 `content`，键名一变就变成
+/// 「一条都没匹配上」—— 又是一次静默失效。
+fn hit_content(hit: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = hit.as_str() {
+        return Some(s);
+    }
+    for key in ["content", "text", "memory", "summary", "body"] {
+        if let Some(s) = hit.get(key).and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// 词表里哪些词在命中集里出现过（**大小写不敏感**：`rust` 不该因为写成 `Rust` 判失败）。
+fn terms_present(hits: &[serde_json::Value], terms: &[String]) -> Vec<String> {
+    terms
+        .iter()
+        .filter(|t| {
+            let needle = t.to_lowercase();
+            hits.iter()
+                .filter_map(hit_content)
+                .any(|c| c.to_lowercase().contains(&needle))
+        })
+        .cloned()
+        .collect()
+}
+
 const HELP: &str = "\
 mcp-memory-seed —— A/B 注入前的记忆预置
 
@@ -136,7 +195,10 @@ mcp-memory-seed —— A/B 注入前的记忆预置
                            （cortex-mcp 无相似度阈值 ⇒ hits 数不代表相关性，必须看内容）
   --require-topics a,b,c   闸门：注入的 k 条里至少要有一条含其中某个主题词，
                            否则 exit 3（这条比「命中 K/K」诚实）
-  --verify-only            不写入，只跑 --verify-query 审计现有库（库里已有数据时用）
+  --forbid-strings a,b,c   闸门：注入的 k 条里不许出现这些词（姓名/公司/学校），
+                           出现即 exit 3（泄漏检查；脱敏只清证件/手机/邮箱）
+  --verify-only            不新增记忆，只跑 --verify-query 审计现有库内容
+                           （注意 recall 会更新 access_count/last_accessed）
   --dry-run                只打印不写入
   --write-timeout-ms <n>   单条写入超时，默认 15000
   --program <解释器>       默认 python（应指向装了 cortex-mcp 的 venv）
@@ -154,7 +216,39 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 审计模式：不改库，只验。库里已有数据时用它，避免"为了检查又灌一遍"
+    // 闸门必须和 --verify-query 一起出现。否则闸门整段被跳过、退出码 0，
+    // 调用方的 hook 会当成「过了」—— 正是本轮在修的「看起来通过、其实没测」。
+    if args.verify_query.is_none() {
+        for (flag, given) in [
+            ("--require-topics", args.require_topics.is_some()),
+            ("--forbid-strings", args.forbid_strings.is_some()),
+        ] {
+            if given {
+                eprintln!("{flag} 需要配 --verify-query：没有 query 就没有 recall，闸门无事可审");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // 词表在**连接之前**解析完：参数错要当场 exit 2，不能等 recall 回来才报。
+    let require_topics = match args.require_topics.as_deref().map(parse_gate_list) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => {
+            eprintln!("--require-topics：{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let forbid_strings = match args.forbid_strings.as_deref().map(parse_gate_list) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => {
+            eprintln!("--forbid-strings：{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 审计模式：不新增记忆，只验。库里已有数据时用它，避免"为了检查又灌一遍"
     let texts = if args.verify_only {
         if args.verify_query.is_none() {
             eprintln!("--verify-only 需要配 --verify-query（否则无事可做）");
@@ -221,8 +315,8 @@ async fn main() -> ExitCode {
 
     let mut ok_ids: Vec<String> = Vec::new();
     let mut failed = 0usize;
-    // 主题词闸门未过：写入本身成功，但内容与本次岗位不匹配 ⇒ 单独退出码
-    let mut topic_gate_failed = false;
+    // 内容闸门未过：写入本身成功，但内容不合格（缺主题词 / 出现禁用词）⇒ 单独退出码
+    let mut content_gate_failed = false;
     for (i, text) in texts.iter().enumerate() {
         let started = Instant::now();
         match client
@@ -315,10 +409,15 @@ async fn main() -> ExitCode {
                             .is_some_and(|id| ok_ids.iter().any(|o| o == id))
                     })
                     .count();
-                println!(
-                    "  命中本轮新灌：{overlap}/{}（⚠️ 此数在非空库上恒真，只证明写入+通道，不证明相关性）",
-                    ok_ids.len()
-                );
+                if args.verify_only {
+                    // 审计模式下 ok_ids 恒空，打 "0/0" 只会误导（看着像一条都没命中）
+                    println!("  本轮新灌：无（--verify-only 未写入，overlap 无意义）");
+                } else {
+                    println!(
+                        "  命中本轮新灌：{overlap}/{}（⚠️ 此数在非空库上恒真，只证明写入+通道，不证明相关性）",
+                        ok_ids.len()
+                    );
+                }
 
                 if hits.is_empty() {
                     println!(
@@ -327,44 +426,49 @@ async fn main() -> ExitCode {
                     );
                 }
 
-                // 主题词闸门：比 K/K 诚实得多的判据 —— 看内容里有没有写明的主题。
-                // hits 为空时不跑：那是「没检索到」，上面已经报过，别重复告警也别误判 exit 3。
-                if let Some(topics) = args.require_topics.as_ref().filter(|_| !hits.is_empty()) {
-                    let want: Vec<&str> = topics
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .collect();
-                    let matched: Vec<&str> = want
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            hits.iter().any(|h| {
-                                h.get("content")
-                                    .and_then(|v| v.as_str())
-                                    .map(|c| c.contains(t))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .collect();
-                    println!(
-                        "  主题词命中：{}/{}（{}）",
-                        matched.len(),
-                        want.len(),
-                        if matched.is_empty() {
-                            "无".to_string()
-                        } else {
-                            matched.join("、")
-                        }
-                    );
-                    if matched.is_empty() {
+                // 内容闸门。hits 为空时不跑：那是「没检索到」，上面已经报过，
+                // 别重复告警，也别把「没测到」误判成「内容不对」(exit 3)。
+                if !hits.is_empty() {
+                    // ① 主题词：至少命中一个，否则算 preload 跑偏
+                    if let Some(want) = &require_topics {
+                        let matched = terms_present(&hits, want);
                         println!(
-                            "  ⚠️ 注入的 {n} 条里没有任何一条含指定主题词 ⇒ preload 内容与本次\
-                             岗位不匹配。带着它跑 A/B，Δ≠0 也分不清是「记忆有用」还是「被无关\
-                             内容带偏」。先改 preload。",
-                            n = hits.len()
+                            "  主题词命中：{}/{}（{}）",
+                            matched.len(),
+                            want.len(),
+                            if matched.is_empty() {
+                                "无".to_string()
+                            } else {
+                                matched.join("、")
+                            }
                         );
-                        topic_gate_failed = true;
+                        if matched.is_empty() {
+                            println!(
+                                "  ⚠️ 注入的 {n} 条里没有任何一条含指定主题词 ⇒ preload 内容与本次\
+                                 岗位不匹配。带着它跑 A/B，Δ≠0 也分不清是「记忆有用」还是「被无关\
+                                 内容带偏」。先改 preload。",
+                                n = hits.len()
+                            );
+                            content_gate_failed = true;
+                        }
+                    }
+
+                    // ② 禁用词（姓名 / 公司 / 学校）：一个都不许出现。
+                    // 为什么必须机械化：`redact()` 只清证件/手机/邮箱，姓名与公司是明确
+                    // 交给 prompt 禁令兜的 —— 人眼在 5×60 字里找漏一个名字，比脚本容易漏。
+                    if let Some(forbidden) = &forbid_strings {
+                        let leaked = terms_present(&hits, forbidden);
+                        if leaked.is_empty() {
+                            println!("  禁用词：0/{} 未出现 ✓", forbidden.len());
+                        } else {
+                            println!(
+                                "  ⚠️ 注入的 {} 条里出现了禁用词：{} ⇒ 这是泄漏：本轮要传的那份\
+                                 简历的姓名/公司不该出现在参考段里。先改 preload。",
+                                hits.len(),
+                                leaked.join("、")
+                            );
+                            content_gate_failed = true;
+                        }
                     }
                 }
             }
@@ -379,10 +483,63 @@ async fn main() -> ExitCode {
 
     if failed > 0 {
         ExitCode::from(1)
-    } else if topic_gate_failed {
-        // 写入成功但内容跑偏：用一个分开的码，脚本 hook 能区分「没写进去」和「写得不对」
+    } else if content_gate_failed {
+        // 写入成功但内容不合格：用一个分开的码，脚本 hook 能区分「没写进去」和「写得不对」
         ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 参数错 ≠ 内容不匹配：空词表必须 exit 2（以前是 exit 3 + 假故障）。
+    #[test]
+    fn gate_list_rejects_blank_terms() {
+        assert!(parse_gate_list(",,").is_err());
+        assert!(parse_gate_list("  ,  ").is_err());
+        assert!(parse_gate_list("").is_err());
+    }
+
+    #[test]
+    fn gate_list_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_gate_list(" 后端 , 招聘,, Rust ").unwrap(),
+            vec!["后端".to_string(), "招聘".to_string(), "Rust".to_string()]
+        );
+    }
+
+    /// 闸门读不到 `content` 时不能静默判「不匹配」，要退回其它常见键。
+    #[test]
+    fn hit_content_falls_back_to_other_keys() {
+        assert_eq!(hit_content(&json!({"content": "甲"})), Some("甲"));
+        assert_eq!(hit_content(&json!({"text": "乙"})), Some("乙"));
+        assert_eq!(hit_content(&json!("丙")), Some("丙"));
+        assert_eq!(hit_content(&json!({"id": "只有 id"})), None);
+    }
+
+    /// 主题词：大小写不敏感；命中集里没有的键不能拖垮整条判定。
+    #[test]
+    fn terms_present_ignores_case_and_missing_content() {
+        let hits = vec![
+            json!({"id": "m-1", "content": "后端 岗位画像：Rust + MySQL"}),
+            json!({"id": "m-2"}), // 无 content：不能因此 panic 或整体判负
+        ];
+        let terms = vec!["rust".to_string(), "前端".to_string()];
+        assert_eq!(terms_present(&hits, &terms), vec!["rust".to_string()]);
+    }
+
+    /// 禁用词走同一套匹配：出现即非空 ⇒ 调用方 exit 3。
+    #[test]
+    fn terms_present_reports_leaked_strings() {
+        let hits = vec![json!({"content": "曾在 中国建设银行 做后端"})];
+        let forbidden = vec!["中国建设银行".to_string(), "张三".to_string()];
+        assert_eq!(
+            terms_present(&hits, &forbidden),
+            vec!["中国建设银行".to_string()]
+        );
     }
 }

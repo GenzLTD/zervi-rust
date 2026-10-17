@@ -73,9 +73,6 @@ pub fn hit_text(hit: &MemoryHit) -> Option<String> {
     }
 }
 
-/// 把命中整理成「可直接拼进 prompt 的若干行」。
-///
-/// 每行都做：脱敏 → 折成单行（参考段自己的换行会打乱结构）→ 按字符截断。
 /// 取一条命中的 id（cortex-mcp 的记录键是 `id`）。
 ///
 /// 为什么要 id 而不是只留文本：`recall` **没有相似度阈值** ——
@@ -90,6 +87,8 @@ pub fn hit_id(hit: &MemoryHit) -> Option<String> {
 }
 
 /// 准备注入行，**同时**返回这些行的来源 id（顺序与行一一对应）。
+///
+/// 每行都做：脱敏 → 折成单行（参考段自己的换行会打乱结构）→ 按字符截断。
 pub fn prepare(
     hits: &[MemoryHit],
     max_hits: usize,
