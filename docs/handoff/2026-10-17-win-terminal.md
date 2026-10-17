@@ -33,7 +33,11 @@
 - 验证：**无 token `GET /health` = 200**；**坏 token / 无 token `POST /upload` = 401**。
 
 ### 2.3 user-service `get_profile` 按 sub 建档（upsert）
-- 逻辑：以 `id = sub` 命中则直接返回；未命中则插入默认行（`role=candidate` / `status=active` / `password_hash` 空串＝未设置），**绝不触碰 `adirp_auth`**。
+- 逻辑：以 `id = sub` 命中则直接返回（不增行）。
+- **插入前两道前置校验（任一不满足都【不插入】、两个库行数都不变）**：
+  1. `role` 必须是 `candidate` / `recruiter` / `admin`，否则返回 **400**（未知 role 含 `observer` 不再落成 `candidate`）。
+  2. `phone` 不得已被其它 sub 占用，否则返回 **409**（不再折成 500 的 DB 唯一键错误）。
+- 通过校验才插入默认行（`status=active` / `password_hash` 空串＝未设置），**绝不触碰 `adirp_auth`**。
 
 | 断言 | 结果 | 证据 |
 |---|---|---|
@@ -42,6 +46,8 @@
 | ③ 伪造/坏 token 仍 401 | ✅ PASS | 坏 token=401，无 token=401 |
 | ④ 不往 `adirp_auth` 写新行 | ✅ PASS | `adirp_auth` 库不存在；user-service 不连接 auth-service，天然不写 |
 | ④' 建档行 `password_hash` 为空（未设置） | ✅ PASS | `password_hash=''` |
+| ⑤ 未知 role（observer）返回 **400**、不插入 | ✅ PASS | `status=400`，行数仍为 1、`OBS_SUB` 不存在 |
+| ⑥ 另一 sub 配已存在手机号返回 **409**、不插入 | ✅ PASS | `status=409`，行数仍为 1、`COL_SUB` 不存在、`adirp_auth` 仍 0 |
 
 ### 2.4 环境补充（仓库无 SQL，已自建）
 - 按 `models/user.rs` 反推，在本地 MySQL 8.4（`localhost:3306`，凭据走环境变量注入，**不入库**）新建：
@@ -59,4 +65,4 @@
 - 边界严守：法兰克福 / Vultr / Looma 契约副本零触碰；pin 未改；gap-close 工作区未动。
 
 ---
-附带运行中的本机服务（供复核）：`user-service` :3002、`upload-service` :3007（均在 `127e4fc` 工作区构建产物）。
+附带运行中的本机服务（供复核）：`user-service` :3002、`upload-service` :3007（终端分支最新提交构建产物）。

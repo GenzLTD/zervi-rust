@@ -16,8 +16,11 @@ impl UserService {
     /// 获取用户资料（按 sub 建档）
     ///
     /// - 已存在（以 id = sub 命中）：直接返回，不新增行。
-    /// - 不存在：插入一条默认行（role=candidate / status=active / password_hash 空串代表「未设置」），
-    ///   再返回。绝不触碰 adirp_auth。
+    /// - 不存在（新 sub）：插入前做两道前置校验，任一不满足都**不插入**、两个库行数都不变：
+    ///   1. role 必须是 candidate/recruiter/admin，否则返回 400（未知 role 含 observer 不落成 candidate）；
+    ///   2. phone 不得已被其它 sub 占用，否则返回 409（不再折成 500）。
+    /// - 通过校验才插入一条默认行（status=active / password_hash 空串代表「未设置」），再返回。
+    /// - 绝不触碰 adirp_auth。
     pub async fn get_profile(
         db: &DatabaseConnection,
         user_id: String,
@@ -25,8 +28,29 @@ impl UserService {
         phone: String,
         role: String,
     ) -> Result<UserProfile> {
+        // 已存在（以 id = sub 命中）：直接返回，不新增行。
         if let Some(user) = User::find_by_id(user_id.clone()).one(db).await? {
             return Ok(Self::to_profile(&user));
+        }
+
+        // 未知 role（含 observer）在插入前拒绝，不落成 candidate，两个库行数都不变。
+        let role_enum = match role.as_str() {
+            "candidate" => UserRole::Candidate,
+            "recruiter" => UserRole::Recruiter,
+            "admin" => UserRole::Admin,
+            other => {
+                return Err(AppError::BadRequest(format!("不支持的 role: {}", other)));
+            }
+        };
+
+        // 另一个 sub 带上已存在的 phone：返回 409，不插入（不再折成 500）。
+        if User::find()
+            .filter(user::Column::Phone.eq(&phone))
+            .one(db)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::DuplicateEntry(format!("手机号 {} 已被占用", phone)));
         }
 
         let now = Utc::now().naive_utc();
@@ -37,7 +61,7 @@ impl UserService {
             password_hash: Set(String::new()), // 空 password_hash 当未设置
             name: Set(name),
             avatar: Set(None),
-            role: Set(parse_role(&role)),
+            role: Set(role_enum),
             status: Set(UserStatus::Active),
             created_at: Set(now),
             updated_at: Set(now),
@@ -163,14 +187,5 @@ impl UserService {
         user.update(db).await?;
 
         Ok(())
-    }
-}
-
-/// 把 token 里的 role 字符串映射到枚举，非法值回退为 Candidate
-fn parse_role(s: &str) -> UserRole {
-    match s {
-        "recruiter" => UserRole::Recruiter,
-        "admin" => UserRole::Admin,
-        _ => UserRole::Candidate,
     }
 }
