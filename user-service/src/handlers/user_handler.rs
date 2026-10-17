@@ -17,8 +17,14 @@ pub async fn get_profile(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>, // JWT中间件会注入
 ) -> Result<ApiResponse<UserProfile>> {
-    let user_id = claims.sub;
-    let profile = UserService::get_profile(&state.db, user_id).await?;
+    let profile = UserService::get_profile(
+        &state.db,
+        claims.sub.clone(),
+        claims.name.clone(),
+        claims.phone.clone(),
+        claims.role.clone(),
+    )
+    .await?;
 
     Ok(ApiResponse::success(profile))
 }

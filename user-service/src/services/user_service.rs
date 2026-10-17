@@ -3,7 +3,7 @@ use sea_orm::*;
 
 use crate::{
     dto::{ChangePasswordRequest, UpdateProfileRequest, UserProfile},
-    models::user::{self, Entity as User},
+    models::user::{self, Entity as User, UserRole, UserStatus},
     utils::{
         error::{AppError, Result},
         password,
@@ -13,23 +13,51 @@ use crate::{
 pub struct UserService;
 
 impl UserService {
-    /// 获取用户资料
-    pub async fn get_profile(db: &DatabaseConnection, user_id: String) -> Result<UserProfile> {
-        let user = User::find_by_id(user_id)
-            .one(db)
-            .await?
-            .ok_or(AppError::NotFound("用户不存在".to_string()))?;
+    /// 获取用户资料（按 sub 建档）
+    ///
+    /// - 已存在（以 id = sub 命中）：直接返回，不新增行。
+    /// - 不存在：插入一条默认行（role=candidate / status=active / password_hash 空串代表「未设置」），
+    ///   再返回。绝不触碰 adirp_auth。
+    pub async fn get_profile(
+        db: &DatabaseConnection,
+        user_id: String,
+        name: String,
+        phone: String,
+        role: String,
+    ) -> Result<UserProfile> {
+        if let Some(user) = User::find_by_id(user_id.clone()).one(db).await? {
+            return Ok(Self::to_profile(&user));
+        }
 
-        Ok(UserProfile {
+        let now = Utc::now().naive_utc();
+        let active = user::ActiveModel {
+            id: Set(user_id.clone()),
+            phone: Set(phone),
+            email: Set(None),
+            password_hash: Set(String::new()), // 空 password_hash 当未设置
+            name: Set(name),
+            avatar: Set(None),
+            role: Set(parse_role(&role)),
+            status: Set(UserStatus::Active),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        let inserted = active.insert(db).await?;
+        Ok(Self::to_profile(&inserted))
+    }
+
+    /// 把 user::Model 映射为响应 DTO
+    fn to_profile(user: &user::Model) -> UserProfile {
+        UserProfile {
             id: user.id.clone(),
-            phone: user.phone,
-            email: user.email,
-            name: user.name,
-            avatar: user.avatar,
+            phone: user.phone.clone(),
+            email: user.email.clone(),
+            name: user.name.clone(),
+            avatar: user.avatar.clone(),
             role: user.role.to_string(),
             status: user.status.to_string(),
             created_at: user.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-        })
+        }
     }
 
     /// 更新用户资料
@@ -135,5 +163,14 @@ impl UserService {
         user.update(db).await?;
 
         Ok(())
+    }
+}
+
+/// 把 token 里的 role 字符串映射到枚举，非法值回退为 Candidate
+fn parse_role(s: &str) -> UserRole {
+    match s {
+        "recruiter" => UserRole::Recruiter,
+        "admin" => UserRole::Admin,
+        _ => UserRole::Candidate,
     }
 }

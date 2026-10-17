@@ -271,8 +271,11 @@ async fn main() -> anyhow::Result<()> {
         .allow_headers(Any);
 
     // 构建路由
-    let app = Router::new()
-        .route("/health", get(health_check))
+    //
+    // ⚠️ `/health` 必须留在鉴权中间件**之外**：上传服务的健康检查也不带 Bearer。
+    //    用 `route_layer` 只包裹受保护子路由，使无 token 的 `GET /health` = 200，
+    //    而坏 token 访问 `/upload` 等仍 401（与 user-service 同构）。
+    let protected = Router::new()
         // 需要JWT验证的路由
         .route("/upload", post(handlers::upload_single))
         .route("/upload/batch", post(handlers::batch_upload_and_parse))
@@ -295,10 +298,14 @@ async fn main() -> anyhow::Result<()> {
             "/optimize/ats-report",
             post(handlers::generate_ats_report_word),
         )
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             jwt_middleware::auth_middleware,
-        ))
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .merge(protected)
         // ⭐⭐⭐ 关键修复：设置 Axum multipart 的请求体大小限制
         // 计算：批量数量 × 单文件大小 = 总限制
         // 例如：30个文件 × 20MB = 600MB
