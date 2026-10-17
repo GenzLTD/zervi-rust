@@ -73,17 +73,6 @@ impl DeepSeekClient {
         )
     }
 
-    /// 显式指定超时（秒），温度/种子取 env 默认值。
-    pub fn with_timeout(base_url: String, model: String, timeout_secs: u64) -> Self {
-        Self::with_params(
-            base_url,
-            model,
-            timeout_secs,
-            Self::temperature_from_env(),
-            Self::seed_from_env(),
-        )
-    }
-
     /// 全参数构造：主流程走这条，便于把 `Config` 里的值打日志对账。
     pub fn with_params(
         base_url: String,
