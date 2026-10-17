@@ -95,10 +95,14 @@ mod tests {
     #[test]
     fn test_jwt_generation_and_verification() {
         let jwt_service = JwtService::new("test_secret".to_string(), 3600);
-        let user_id = Uuid::new_v4();
+        // 既有缺陷修复：原来写 `Uuid::new_v4()`，两个问题 ——
+        // ① 测试模块里没导入 Uuid（整个 crate 的测试目标编译不过）；
+        // ② `generate_token` 要的是 `String`，claims.sub 也是 `String`，
+        //    旧写法是早期 API 的残留。这里改成字符串并 clone 一次。
+        let user_id = uuid::Uuid::new_v4().to_string();
 
         let token = jwt_service
-            .generate_token(user_id, "candidate", "测试用户", "13800138000")
+            .generate_token(user_id.clone(), "candidate", "测试用户", "13800138000")
             .unwrap();
 
         let claims = jwt_service.verify_token(&token).unwrap();

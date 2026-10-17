@@ -8,7 +8,7 @@ use axum::{
 };
 
 use crate::{
-    dto::{UploadDetail, UploadListItem, UploadRecord},
+    dto::{UploadDetail, UploadListItem, UploadRecord, UploadRecordWithMemory},
     services::UploadService,
     utils::{
         error::{AppError, Result},
@@ -32,7 +32,7 @@ pub async fn upload_single(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     mut multipart: Multipart,
-) -> Result<ApiResponse<UploadRecord>> {
+) -> Result<ApiResponse<UploadRecordWithMemory>> {
     use crate::dto::ClassificationDto;
 
     while let Some(field) = multipart
@@ -77,6 +77,26 @@ pub async fn upload_single(
 
         tracing::info!("✅ 文件上传成功: {}, 开始文档处理...", upload_record.id);
 
+        // 【钩子 1】优化前 recall：该用户历史简历版本 / 历次反馈 / 目标岗位
+        //
+        // 失败语义（已拍定）：**跳过记忆继续**，不阻断主链路。用户看不到服务端
+        // 日志，所以跳过原因必须进响应体（memory_skip_reason）。
+        // 超时上限由 MCP_RECALL_TIMEOUT_MS 控制（默认 5s），保证冷启动时记忆层
+        // 不会把 /upload 拖得更久。
+        let recall_query = format!("{} 简历 优化 历史反馈 目标岗位", file_name);
+        let mut memory_skip_reason: Option<String> = None;
+        let mut memory_used = true;
+        match state.memory.recall(&recall_query, Some("episodic"), 5).await {
+            Ok(hits) => {
+                tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
+            }
+            Err(reason) => {
+                tracing::warn!("⚠️  记忆层跳过（recall）: {}", reason);
+                memory_used = false;
+                memory_skip_reason = Some(reason);
+            }
+        }
+
         // 2. 同步执行文档处理（获取分类结果）
         let processed = state
             .processor
@@ -113,6 +133,50 @@ pub async fn upload_single(
             })
         });
 
+        // 【钩子 2】优化后 remember：把这次提取的结果写进终端本地记忆
+        //
+        // 只在 recall 成功时才写（记忆层已坏就不必再加一次等待）。
+        // 内容刻意不含手机/邮箱等联系方式 —— 那些已在上传库里；记忆体只留
+        // 「可复用的画像」，metadata 标 privacy_tier=L0_PII 让合规层识别。
+        if memory_used {
+            let skills = processed.extracted_info.skills.iter().take(10).cloned().collect::<Vec<_>>();
+            let content = format!(
+                "上传简历「{}」（分类={:?}）：整体质量 {}/100（完整度 {}，清晰度 {}，专业度 {}）；\
+                 教育 {} 项、工作 {} 项；技能：{}",
+                file_name,
+                processed.category,
+                processed.quality_score.overall_score,
+                processed.quality_score.completeness,
+                processed.quality_score.clarity,
+                processed.quality_score.professionalism,
+                processed.extracted_info.education.len(),
+                processed.extracted_info.work_experience.len(),
+                if skills.is_empty() { "（未识别）".to_string() } else { skills.join("、") },
+            );
+
+            let metadata = serde_json::json!({
+                "source": "zervi-rust/upload-service",
+                "upload_id": upload_record.id,
+                "file_name": file_name,
+                // 跨境合规保留键：简历属个人信息，出网时必须过 M3 判定
+                "privacy_tier": "L0_PII",
+                "redacted": true,
+            });
+
+            match state
+                .memory
+                .remember(&content, Some("episodic"), Some(metadata), Some(0.6))
+                .await
+            {
+                Ok(id) => tracing::info!("🧠 记忆已写入: {}", id),
+                Err(reason) => {
+                    tracing::warn!("⚠️  记忆层跳过（remember）: {}", reason);
+                    memory_used = false;
+                    memory_skip_reason = Some(reason);
+                }
+            }
+        }
+
         let record = UploadRecord {
             id: upload_record.id.clone(),
             original_name: file_name.clone(),
@@ -130,7 +194,11 @@ pub async fn upload_single(
         }
 
         return Ok(ApiResponse::success_with_message(
-            record,
+            UploadRecordWithMemory {
+                record,
+                memory_used,
+                memory_skip_reason,
+            },
             "上传成功并完成智能分类",
         ));
     }

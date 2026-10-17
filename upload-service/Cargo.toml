@@ -7,6 +7,8 @@ edition = "2021"
 # 共享库
 common = { path = "../shared/common" }
 consul-client = { path = "../shared/consul-client" }
+# 终端侧 MCP 客户端：把 cortex-mcp（Python）作为 stdio 子进程托管，承载记忆层
+mcp-client = { path = "../shared/mcp-client" }
 
 # Web框架
 axum = { workspace = true, features = ["multipart"] }

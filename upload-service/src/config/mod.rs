@@ -31,6 +31,26 @@ pub struct Config {
     pub db_max_connections: u32,
     pub max_concurrent_uploads: usize,
     pub max_batch_size: usize,
+    // LLM HTTP 超时（秒）
+    //
+    // 为什么需要它：`deepseek_client.rs` 原来硬编码 300s，而本机 CPU 推理冷态
+    // 单跳提取实测 336.1s、`upload_single` 顺序发两跳（第一跳 220.52s）⇒ 300s
+    // 必然超时。原「300s」既不成立也不可调，所以提为 env。
+    pub llm_http_timeout_secs: u64,
+    // 记忆层（cortex-mcp，作为 stdio 子进程随终端起停）
+    pub mcp_enabled: bool,
+    pub mcp_python: String,
+    pub mcp_module: String,
+    pub mcp_cwd: Option<String>,
+    // 注入给 cortex-mcp 子进程的 DSN
+    //
+    // ⚠️ 必须注入：cortex-mcp 的 `config.py` 默认 DSN 是 `...:5432/cortex`，
+    // 而 compose 把宿主 5433 映射进容器 ⇒ 不覆盖就会连到错端口（或连上 ServBay
+    // 上另一个库）。握手不碰库所以看不出来，一落库就错。
+    pub cortex_database_url: Option<String>,
+    pub mcp_connect_timeout_ms: u64,
+    pub mcp_recall_timeout_ms: u64,
+    pub mcp_write_timeout_ms: u64,
 }
 
 impl Config {
@@ -118,6 +138,35 @@ impl Config {
                 .unwrap_or_else(|_| "20".to_string()) // ✅ 一次最多20份
                 .parse()
                 .expect("MAX_BATCH_SIZE must be a number"),
+            // LLM HTTP 超时：默认 900s（两跳冷态的余量；300s 已实测不够）
+            llm_http_timeout_secs: env::var("LLM_HTTP_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "900".to_string())
+                .parse()
+                .expect("LLM_HTTP_TIMEOUT_SECS must be a number"),
+            // 记忆层：默认关闭（opt-in）。启用后连不上只降级、不影响主链路。
+            mcp_enabled: env::var("MCP_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            mcp_python: env::var("MCP_PYTHON").unwrap_or_else(|_| "python".to_string()),
+            mcp_module: env::var("MCP_MODULE")
+                .unwrap_or_else(|_| "cortex_mcp.server".to_string()),
+            mcp_cwd: env::var("MCP_CWD").ok().filter(|s| !s.trim().is_empty()),
+            cortex_database_url: env::var("CORTEX_DATABASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            mcp_connect_timeout_ms: env::var("MCP_CONNECT_TIMEOUT_MS")
+                .unwrap_or_else(|_| "20000".to_string())
+                .parse()
+                .unwrap_or(20_000),
+            mcp_recall_timeout_ms: env::var("MCP_RECALL_TIMEOUT_MS")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse()
+                .unwrap_or(5_000),
+            mcp_write_timeout_ms: env::var("MCP_WRITE_TIMEOUT_MS")
+                .unwrap_or_else(|_| "15000".to_string())
+                .parse()
+                .unwrap_or(15_000),
         }
     }
 }

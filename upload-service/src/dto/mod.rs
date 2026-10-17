@@ -14,6 +14,20 @@ pub struct UploadRecord {
     pub jd_info: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadRecordWithMemory {
+    #[serde(flatten)]
+    pub record: UploadRecord,
+    /// 本次请求记忆层是否真的参与了（recall 与 remember 都成功）。
+    ///
+    /// 为什么进响应体：终端机单用户看不到服务端日志，降级必须让客户端可见，
+    /// 否则是静默功能退化 —— 比 500 更难查。
+    pub memory_used: bool,
+    /// 没参与的原因（未启用 / 启动失败 / 超时 / 子进程已退出）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_skip_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassificationDto {
     pub doc_type: String,

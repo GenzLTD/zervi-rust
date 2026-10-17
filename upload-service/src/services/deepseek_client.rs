@@ -10,9 +10,37 @@ pub struct DeepSeekClient {
 }
 
 impl DeepSeekClient {
+    /// 默认超时（秒）。
+    ///
+    /// 从 300s 提到 900s 的依据：本机 CPU 推理（qwen2.5:3b Q4_K_M）冷态
+    /// 单跳提取实测 **336.1s**，`upload_single` 顺序发两跳（第一跳 220.52s 热态），
+    /// 单请求合计 440–560s。300s 会让**第一跳就超时**（实测 `/upload` 500 @300.9s）。
+    ///
+    /// ⚠️ 调大超时只是**不返回 500**，10 分钟同步 HTTP 本身仍是产品缺陷；
+    /// 正解是 `/upload` 异步化（202 + task_id + 轮询/SSE），已列入路线。
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+
+    /// 从 `LLM_HTTP_TIMEOUT_SECS` 读取超时（秒），未设或非法则用默认值。
+    pub fn timeout_secs_from_env() -> u64 {
+        std::env::var("LLM_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// 构造：超时取 `LLM_HTTP_TIMEOUT_SECS`（默认 900s）。
+    ///
+    /// 保留这个两参签名，是为了让 `optimize_handler` / `batch_upload_handler`
+    /// 这些**直接读 env 自己造 client** 的旧调用点不必一起改，也能拿到新默认值。
     pub fn new(base_url: String, model: String) -> Self {
+        Self::with_timeout(base_url, model, Self::timeout_secs_from_env())
+    }
+
+    /// 显式指定超时（秒）。主流程走这条，便于把 `Config` 里的值打日志对账。
+    pub fn with_timeout(base_url: String, model: String, timeout_secs: u64) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300)) // ⭐ 从120秒增加到300秒（5分钟）
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .expect("Failed to create HTTP client");
 

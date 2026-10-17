@@ -22,7 +22,8 @@ mod jwt_middleware;
 
 use config::Config;
 use services::{
-    deepseek_client::DeepSeekClient, document_processor::DocumentProcessor, storage::LocalStorage,
+    deepseek_client::DeepSeekClient, document_processor::DocumentProcessor,
+    memory_layer::MemoryLayer, storage::LocalStorage,
 };
 // 进程内 GGUF 推理客户端（仅 `--features local-llm` 时存在）
 #[cfg(feature = "local-llm")]
@@ -35,6 +36,8 @@ pub struct AppState {
     pub storage: Arc<LocalStorage>,
     pub jwt_service: JwtService,
     pub processor: Arc<DocumentProcessor>,
+    // 记忆层（cortex-mcp）。不可用时内部为 None，调用返回「跳过原因」。
+    pub memory: Arc<MemoryLayer>,
     // Phase 1改进: 并发控制
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
     pub config: Config,
@@ -55,7 +58,11 @@ fn build_remote_processor(config: &Config) -> Arc<DocumentProcessor> {
         config.deepseek_model
     );
 
-    let deepseek = DeepSeekClient::new(config.deepseek_url.clone(), config.deepseek_model.clone());
+    let deepseek = DeepSeekClient::with_timeout(
+        config.deepseek_url.clone(),
+        config.deepseek_model.clone(),
+        config.llm_http_timeout_secs,
+    );
 
     Arc::new(DocumentProcessor::new(
         deepseek,
@@ -202,12 +209,31 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // 初始化记忆层（cortex-mcp，stdio 子进程）
+    //
+    //  失败语义：**跳过记忆继续**。连不上只降级，唯一可见的降级信号是
+    //  `/upload` 响应体里的 `memory_used:false` + `memory_skip_reason`。
+    let memory = Arc::new(MemoryLayer::from_config(&config).await);
+    tracing::info!(
+        "   - 记忆层(cortex-mcp): {}",
+        if memory.is_enabled() {
+            "已启用"
+        } else {
+            "未启用 / 不可用（/upload 将跳过记忆）"
+        }
+    );
+    tracing::info!(
+        "   - LLM HTTP 超时: {}s（LLM_HTTP_TIMEOUT_SECS）",
+        config.llm_http_timeout_secs
+    );
+
     // 创建应用状态
     let state = AppState {
         db: db.clone(),
         storage,
         jwt_service,
         processor,
+        memory: memory.clone(),
         // Phase 1改进: 添加并发控制
         upload_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_uploads)),
         config: config.clone(),
@@ -350,6 +376,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("✅ Deregistered from Consul");
         }
     }
+
+    // 关闭记忆层子进程（否则 cortex-mcp 会变成孤儿进程）
+    memory.close().await;
 
     tracing::info!("👋 Upload Service stopped");
 
