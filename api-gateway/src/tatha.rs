@@ -11,10 +11,12 @@
 //!
 //! 1. 网关鉴权失败 → 401，**绝不转发**（否则未鉴权流量会撞上 Tatha 的 stub 放行）
 //! 2. `TATHA_BASE_URL` 未配 → 503，**绝不静默放行**（对标它自己的 `QUANTUM_AUTH_URL`，但拒绝降级）
-//! 3. 身份注入按 **ADR-0012 D2** 双头，且**不透传用户 token**
+//! 3. 身份注入按 **ADR-0012 D2**，且**不透传用户 token**
 //!    （Tatha 的 stub 会把 user_id 派生为 `stub-<token>`，切断 THOMAS 跨端关联）：
 //!    - `X-User-Id = sha256(sub)`，`sub` = Supabase UUID —— **稳定主键，必有**
 //!    - `X-User-Email-Hash = sha256(lower(trim(email)))` —— **无真实邮箱时不注入**
+//!    - `X-Actor-Sub = trim(sub)` —— **原始 claims.sub，不哈希**。memory.recall 只认这个头；
+//!      与 `X-User-Id` 并存，不互相替换。客户端自带的同名头在转发前剥离。
 //!
 //! 验签按 **ADR-0012 D1** 双轨：JWKS（Supabase 原生，非对称，缓存 600s）与
 //! HS256（looma 代签 / 存量）按 `alg` 互斥；两轨皆未配置即 401，不降级。
@@ -62,6 +64,8 @@ const SUPABASE_AUDIENCE: &str = "authenticated";
 /// （如 `X-User-Email-Hash` 仅在 token 带 email 时写入），逐个点名迟早会在新增
 /// 头时漏掉一个，而漏掉的那一个恰好就是可伪造的入口。
 const X_USER_PREFIX: &str = "x-user-";
+/// memory.recall 的身份头。不是 `x-user-*`，前缀剥离覆盖不到，必须单独清掉再重写。
+const X_ACTOR_SUB: &str = "x-actor-sub";
 /// JWKS 缓存寿命，对齐 looma `PyJWKClient(lifespan=600)`。
 /// 缓存是硬要求：不得每请求拉网（ADR-0012 D1.1）。
 const JWKS_TTL: Duration = Duration::from_secs(600);
@@ -391,7 +395,20 @@ pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
         }
     };
 
-    // 3) 重写身份头（ADR-0012 D2）：稳定主键 + 可选邮箱哈希，不透传用户 token
+    // 3) 重写身份头（ADR-0012 D2）：稳定主键 + 原始 sub + 可选邮箱哈希，不透传用户 token。
+    //    空白 sub 无法充当 memory.recall 的 actor，401 且不转发。
+    let actor = claims.sub.trim();
+    if actor.is_empty() {
+        warn!("🚫 /v1/ask rejected: token has empty sub");
+        return (StatusCode::UNAUTHORIZED, "missing sub").into_response();
+    }
+    let actor_header = match HeaderValue::from_str(actor) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("🚫 /v1/ask rejected: sub is not a valid header value");
+            return (StatusCode::UNAUTHORIZED, "invalid sub").into_response();
+        }
+    };
     let uid = stable_user_id(&claims.sub);
     let tier = resolve_tier(&claims);
     {
@@ -413,10 +430,13 @@ pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
         for k in forged {
             headers.remove(k);
         }
+        // 客户端自带的原始 sub 一律丢掉，只放网关从 token 取出的那一份。
+        headers.remove(X_ACTOR_SUB);
 
         if let Ok(v) = HeaderValue::from_str(&uid) {
             headers.insert("X-User-Id", v);
         }
+        headers.insert(X_ACTOR_SUB, actor_header);
         // 无真实邮箱（小程序-only 用户）时**不注入**该头 —— 上面的剥离已保证它
         // 不会以客户端携带的值漏出，从而维持 D2 的 email_hash=None 语义
         if let Some(email) = claims
