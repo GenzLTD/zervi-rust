@@ -120,7 +120,7 @@ impl UploadService {
             .await?;
         
         // 2. 调用处理器
-        let processed = processor.process_document(file_data, file_name).await
+        let processed = processor.process_document(file_data, file_name, None).await
             .map_err(|e| {
                 tracing::error!("文档处理失败: {}", e);
                 e

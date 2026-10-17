@@ -365,9 +365,12 @@ async fn process_single_resume(
     let parse_status = "pending"; // 后续可以异步解析
     
     // 2. AI提取信息
+    // 走 config 的单一事实源：config 已统一读 env 并打启动日志（默认 qwen2.5:7b）。
+    // 这里不再二次读 env —— 否则默认值会再次分叉（历史问题：4 处各自兜底，
+    // 终端只装 qwen 时会去打一个不存在的模型名）。
     let deepseek = DeepSeekClient::new(
-        std::env::var("DEEPSEEK_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-        std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-r1:7b".to_string()),
+        state.config.deepseek_url.clone(),
+        state.config.deepseek_model.clone(),
     );
     
     let resume_info = match deepseek.extract_resume_info(&text).await {

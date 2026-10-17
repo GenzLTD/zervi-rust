@@ -48,15 +48,18 @@ pub struct GenerateWordRequest {
 
 /// ATS分析
 pub async fn analyze_ats(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
     Json(req): Json<ATSAnalysisRequest>,
 ) -> Result<ApiResponse<serde_json::Value>> {
     tracing::info!("📊 收到ATS分析请求");
 
+    // 走 config 的单一事实源：config 已统一读 env 并打启动日志（默认 qwen2.5:7b）。
+    // 这里不再二次读 env —— 否则默认值会再次分叉（历史问题：4 处各自兜底，
+    // 终端只装 qwen 时会去打一个不存在的模型名）。
     let deepseek = DeepSeekClient::new(
-        std::env::var("DEEPSEEK_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-        std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-r1:7b".to_string()),
+        state.config.deepseek_url.clone(),
+        state.config.deepseek_model.clone(),
     );
 
     let optimizer = ATSOptimizer::new(deepseek);
@@ -74,15 +77,18 @@ pub async fn analyze_ats(
 
 /// 智能优化
 pub async fn optimize_resume(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
     Json(req): Json<OptimizeRequest>,
 ) -> Result<ApiResponse<serde_json::Value>> {
     tracing::info!("🎯 收到智能优化请求");
 
+    // 走 config 的单一事实源：config 已统一读 env 并打启动日志（默认 qwen2.5:7b）。
+    // 这里不再二次读 env —— 否则默认值会再次分叉（历史问题：4 处各自兜底，
+    // 终端只装 qwen 时会去打一个不存在的模型名）。
     let deepseek = DeepSeekClient::new(
-        std::env::var("DEEPSEEK_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-        std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-r1:7b".to_string()),
+        state.config.deepseek_url.clone(),
+        state.config.deepseek_model.clone(),
     );
 
     let optimizer = ResumeOptimizer::new(deepseek);

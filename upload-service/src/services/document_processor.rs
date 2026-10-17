@@ -132,10 +132,18 @@ impl DocumentProcessor {
     }
 
     /// 完整的文档处理流程
+    /// 处理文档。
+    ///
+    /// `memory_block` 是**已经脱敏、限长、带隔离禁令**的历史记录文本块
+    /// （由 `services::memory_prompt::render_block` 产出），只有简历提取这一
+    /// 分支会用到它；传 `None` 时产出的 prompt 与「没有记忆层」逐字节一致。
+    /// 记忆的 recall / 预算 / 渲染都在 handler 层决定，processor 只负责拼装，
+    /// 这样这里不需要拿到 `Config`。
     pub async fn process_document(
         &self,
         file_data: Bytes,
         file_name: &str,
+        memory_block: Option<&str>,
     ) -> Result<ProcessedDocument, anyhow::Error> {
         let start = std::time::Instant::now();
 
@@ -316,8 +324,14 @@ impl DocumentProcessor {
                 // 如果已经做过快速OCR，就不需要重复OCR了
 
                 // LLM提取信息（支持本地/远程）
+                //
+                // 记忆注入只走这条分支：诗人档案是另一套 schema，混入简历摘要
+                // 会让模型把「质量分/技能」当诗人属性输出。
                 let extraction_start = std::time::Instant::now();
-                let extracted = self.llm_client.extract_resume_info(&parsed.text).await?;
+                let extracted = self
+                    .llm_client
+                    .extract_resume_info_with_memory(&parsed.text, memory_block)
+                    .await?;
                 let extraction_duration = extraction_start.elapsed();
                 extraction_duration_ms = Some(extraction_duration.as_millis() as i64);
                 tracing::info!("⏱️ LLM提取耗时: {:?}", extraction_duration);
@@ -470,7 +484,7 @@ impl DocumentProcessor {
             let task = tokio::spawn(async move {
                 tracing::info!("[{}/{}] 处理文档: {}", i + 1, total, name);
 
-                let result = match processor.process_document(data, &name).await {
+                let result = match processor.process_document(data, &name, None).await {
                     Ok(processed) => ProcessResult {
                         file_name: name.clone(),
                         status: "success".to_string(),

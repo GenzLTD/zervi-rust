@@ -104,17 +104,36 @@ impl DeepSeekClient {
         }
     }
 
-    /// 提取简历信息
+    /// 提取简历信息（不注入记忆）。
+    ///
+    /// 与 `extract_resume_info_with_memory(text, None)` 完全等价，保留这个
+    /// 两参签名是为了让 batch 与优化链路不受注入开关影响。
     pub async fn extract_resume_info(
         &self,
         document_text: &str,
     ) -> Result<ExtractedResumeInfo, anyhow::Error> {
+        self.extract_resume_info_with_memory(document_text, None).await
+    }
+
+    /// 提取简历信息，可选注入一段「历史处理记录」。
+    ///
+    /// `memory_block` 由 `services::memory_prompt::render_block` 产出（已脱敏、
+    /// 已限长、自带隔离禁令）。传 `None` 时 prompt 与「没有记忆层」逐字节一致。
+    pub async fn extract_resume_info_with_memory(
+        &self,
+        document_text: &str,
+        memory_block: Option<&str>,
+    ) -> Result<ExtractedResumeInfo, anyhow::Error> {
         tracing::info!(
-            "🤖 调用DeepSeek提取简历信息，文本长度: {}",
-            document_text.len()
+            "🤖 调用DeepSeek提取简历信息，文本长度: {}, 记忆注入: {}",
+            document_text.len(),
+            match memory_block {
+                Some(b) => format!("{} 字符", b.chars().count()),
+                None => "关闭".to_string(),
+            }
         );
 
-        let prompt = Self::build_extraction_prompt(document_text);
+        let prompt = Self::build_extraction_prompt(document_text, memory_block);
 
         let request = OllamaRequest {
             model: self.model.clone(),
@@ -230,12 +249,23 @@ impl DeepSeekClient {
     }
 
     /// 构建信息提取prompt
-    fn build_extraction_prompt(text: &str) -> String {
+    fn build_extraction_prompt(text: &str, memory_block: Option<&str>) -> String {
         // 限制文本长度，避免超过模型上下文
         let text_preview = if text.len() > 8000 {
             &text[..8000]
         } else {
             text
+        };
+
+        // 记忆段放在正文**之前**：模型对开头的指令遵从度更高，而记忆段自带
+        // 「不得作为信息来源」的禁令，越靠前越能压住「从参考段抄字段」的倾向。
+        // 没有记忆（或开关关闭）时走 else 分支 —— 产出的 prompt 与
+        // 「完全没有记忆层」时逐字节一致，A/B 的对照组才有意义。
+        let body = match memory_block {
+            Some(block) if !block.trim().is_empty() => {
+                format!("{}\n\n简历文本：\n{}", block, text_preview)
+            }
+            _ => format!("简历文本：\n{}", text_preview),
         };
 
         format!(
@@ -275,10 +305,9 @@ impl DeepSeekClient {
   "summary": "个人简介摘要"
 }}
 
-简历文本：
 {}
 "#,
-            text_preview
+            body
         )
     }
 
@@ -598,6 +627,37 @@ mod tests {
         let info: ExtractedResumeInfo = serde_json::from_str("{}").unwrap();
         assert!(info.education.is_empty());
         assert!(info.skills.is_empty());
+    }
+
+    /// 无记忆时 prompt 必须与「空白记忆块」逐字节一致。
+    ///
+    /// 这条是 A/B 的地基：如果 `Some("")` / `Some("   ")` 会改变 prompt，
+    /// 那么「开关打开但 recall 没命中」这一组就和对照组不可比。
+    #[test]
+    fn prompt_without_memory_is_byte_identical() {
+        let text = "张三\n技能：Rust、SQL";
+        let plain = DeepSeekClient::build_extraction_prompt(text, None);
+        let blank = DeepSeekClient::build_extraction_prompt(text, Some("   "));
+        let empty = DeepSeekClient::build_extraction_prompt(text, Some(""));
+        assert_eq!(plain, blank, "空白记忆块不得改变 prompt");
+        assert_eq!(plain, empty, "空串记忆块不得改变 prompt");
+        assert!(plain.contains("简历文本：\n张三"));
+    }
+
+    /// 有记忆时：① 参考段必须在正文之前；② 正文一字不改；③ 输出格式说明仍在。
+    #[test]
+    fn prompt_with_memory_keeps_body_and_schema() {
+        let text = "张三\n技能：Rust";
+        let block = "【历史处理记录 · 仅供参考】\n1. 技能：Go\n【历史处理记录 · 结束】";
+        let prompt = DeepSeekClient::build_extraction_prompt(text, Some(block));
+
+        assert!(prompt.contains(block), "参考段未注入");
+        assert!(prompt.contains(text), "正文被改写");
+        assert!(prompt.contains("\"skills\""), "输出格式说明被破坏");
+        assert!(
+            prompt.find("历史处理记录").unwrap() < prompt.find("张三").unwrap(),
+            "参考段应在正文之前"
+        );
     }
 
     /// 请求体必须带 options：没有它，Ollama 用默认 temperature 0.8 + 随机种子，

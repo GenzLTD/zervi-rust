@@ -48,6 +48,15 @@ pub struct ExtractionDigest {
     pub memory_used: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_skip_reason: Option<String>,
+    /// 记忆是否**真的进了 prompt**（不是「recall 成功」，而是注入块非空）。
+    ///
+    /// 为什么必须单独有这一位：`memory_used=true` 只说明 recall/remember 调通了。
+    /// 若 `MEMORY_PROMPT_INJECTION=false`，或 recall 命中 0 条，prompt 与对照组
+    /// 逐字节一致 —— 此时 Δ 必然为 0。没有这一位，注入阶段看到 Δ=0 时无法区分
+    /// 「记忆没用」和「记忆根本没进去」。
+    pub memory_injected: bool,
+    /// 注入块字符数（0 = 未注入）。用来确认预算生效、以及为 token 成本留证据。
+    pub memory_injected_chars: usize,
     /// `resume` / `job_description` / `poetry_profile` / `other`
     pub doc_type: String,
     /// 传统分类（`Resume` / `CoverLetter` / `Certificate` / `Other`）
@@ -195,6 +204,8 @@ mod tests {
         ExtractionDigest {
             memory_used: true,
             memory_skip_reason: None,
+            memory_injected: true,
+            memory_injected_chars: 512,
             doc_type: "Resume".into(),
             category: "Resume".into(),
             classification_confidence: 0.93,
@@ -249,6 +260,8 @@ mod tests {
         let digest = body.get("extraction_digest").expect("应有 extraction_digest");
         for key in [
             "memory_used",
+            "memory_injected",
+            "memory_injected_chars",
             "doc_type",
             "category",
             "classification_confidence",

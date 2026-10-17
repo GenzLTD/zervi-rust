@@ -8,6 +8,8 @@ pub mod jd_parser;
 pub mod llm_trait;
 // 记忆层门面（托管 cortex-mcp stdio 子进程；失败降级为「跳过记忆」）
 pub mod memory_layer;
+// 记忆 → 提取 prompt 的注入层（脱敏 / 预算 / 强隔离）
+pub mod memory_prompt;
 // 进程内 GGUF 推理：仅 `--features local-llm` 时编译（需 libclang）
 #[cfg(feature = "local-llm")]
 pub mod local_llm_client;

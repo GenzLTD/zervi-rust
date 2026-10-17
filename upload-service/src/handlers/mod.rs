@@ -13,7 +13,7 @@ use crate::{
         ExtractionDigest, QualityDigest, UploadDetail, UploadListItem, UploadRecord,
         UploadRecordWithMemory,
     },
-    services::UploadService,
+    services::{memory_prompt, UploadService},
     utils::{
         error::{AppError, Result},
         jwt::Claims,
@@ -104,6 +104,9 @@ pub async fn upload_single(
         let recall_query = format!("{} 简历 优化 历史反馈 目标岗位", file_name);
         let mut memory_skip_reason: Option<String> = None;
         let mut memory_used = true;
+        // recall 结果渲染成的注入块。开关关闭 / 未命中 ⇒ None ⇒ prompt 与
+        // 「没有记忆层」逐字节一致（A/B 对照组因此才有意义）。
+        let mut memory_block: Option<String> = None;
         if ab_memory_off {
             // 对照组：跳过记忆，其余流程完全一致（同一进程、同一份预热模型）
             memory_used = false;
@@ -114,6 +117,29 @@ pub async fn upload_single(
             match state.memory.recall(&recall_query, Some("episodic"), 5).await {
                 Ok(hits) => {
                     tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
+                    if state.config.memory_prompt_injection {
+                        let lines = memory_prompt::prepare_lines(
+                            &hits,
+                            state.config.memory_inject_max_hits,
+                            state.config.memory_inject_hit_chars,
+                        );
+                        memory_block = memory_prompt::render_block(&lines);
+                        tracing::info!(
+                            "🧠 记忆注入: {}（可用 {} 条 / {} 字符）",
+                            if memory_block.is_some() {
+                                "已注入"
+                            } else {
+                                "无可用条目"
+                            },
+                            lines.len(),
+                            memory_block
+                                .as_ref()
+                                .map(|b| b.chars().count())
+                                .unwrap_or(0)
+                        );
+                    } else {
+                        tracing::debug!("🧠 记忆注入关闭（MEMORY_PROMPT_INJECTION=false）");
+                    }
                 }
                 Err(reason) => {
                     tracing::warn!("⚠️  记忆层跳过（recall）: {}", reason);
@@ -126,7 +152,7 @@ pub async fn upload_single(
         // 2. 同步执行文档处理（获取分类结果）
         let processed = state
             .processor
-            .process_document(data_clone, &file_name)
+            .process_document(data_clone, &file_name, memory_block.as_deref())
             .await
             .map_err(|e| {
                 tracing::error!("❌ 文档处理失败: {}", e);
@@ -225,6 +251,13 @@ pub async fn upload_single(
             Some(ExtractionDigest {
                 memory_used,
                 memory_skip_reason: memory_skip_reason.clone(),
+                // 「注入块非空」才是真注入。开关关着 / 命中 0 条 ⇒ false，
+                // 此时 prompt 与对照组逐字节一致，Δ 必须为 0。
+                memory_injected: memory_block.is_some(),
+                memory_injected_chars: memory_block
+                    .as_ref()
+                    .map(|b| b.chars().count())
+                    .unwrap_or(0),
                 doc_type: processed
                     .classification
                     .as_ref()

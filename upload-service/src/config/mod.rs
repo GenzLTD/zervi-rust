@@ -1,5 +1,20 @@
 use std::env;
 
+/// 默认 Ollama 模型名（`DEEPSEEK_MODEL` 未设时用它）。
+///
+/// **为什么集中到一处**：这个值原本散在 4 个地方（`config::from_env`、
+/// `optimize_handler` 两处、`batch_upload_handler` 一处）。终端只装了
+/// `qwen2.5` 又没设 `DEEPSEEK_MODEL` 时，任何一处漏改都会去打一个不存在的
+/// 模型名 —— 表现是「优化/批量接口 404，单传却正常」，极难归因。
+///
+/// **为什么从 `deepseek-r1:7b` 改成 `qwen2.5:7b`**：终端镜像里没有
+/// deepseek-r1；且 `qwen2.5:3b` 会大量输出 `null` 字段（见 `serde_util` 的
+/// 兜底说明），只能保证不报错，质量不达标。
+pub const DEFAULT_LLM_MODEL: &str = "qwen2.5:7b";
+
+/// 默认 Ollama 地址（本机进程，不走网络）。
+pub const DEFAULT_LLM_URL: &str = "http://localhost:11434";
+
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
@@ -65,6 +80,13 @@ pub struct Config {
     // 为什么用请求头而不是重启换配置：A/B 两组必须共享同一个进程 / 同一份预热
     // 过的 Ollama，否则测到的是冷启动差异，不是记忆的收益。
     pub upload_extraction_digest: bool,
+    // recall 结果是否注入提取 prompt（默认 false）
+    //
+    // 关闭时 prompt 与「没有记忆层」逐字节一致 —— 这才让 A/B 的对照组有意义。
+    // 打开后由 `services::memory_prompt` 负责脱敏、预算与隔离指令。
+    pub memory_prompt_injection: bool,
+    pub memory_inject_max_hits: usize,
+    pub memory_inject_hit_chars: usize,
 }
 
 impl Config {
@@ -101,9 +123,9 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             mineru_url: env::var("MINERU_URL").ok(), // 可选
             deepseek_url: env::var("DEEPSEEK_URL")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+                .unwrap_or_else(|_| DEFAULT_LLM_URL.to_string()),
             deepseek_model: env::var("DEEPSEEK_MODEL")
-                .unwrap_or_else(|_| "deepseek-r1:7b".to_string()),
+                .unwrap_or_else(|_| DEFAULT_LLM_MODEL.to_string()),
             enable_parsing: env::var("ENABLE_PARSING")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
@@ -200,6 +222,25 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+            // 注入开关：默认关。开启前 prompt 与无记忆层逐字节一致。
+            memory_prompt_injection: env::var("MEMORY_PROMPT_INJECTION")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            // 预算：5 条 × 300 字符 ≈ 1500 字符，占正文（已截 8000）的 19%。
+            // 条数超过 recall 的 k（5）没有意义，所以上限就是 5。
+            // 默认值取 `memory_prompt` 里的常量，不在这里再写一遍字面量 ——
+            // 否则又会出现「同一默认值散落多处、改一处漏一处」的老问题。
+            memory_inject_max_hits: env::var("MEMORY_INJECT_MAX_HITS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n > 0 && *n <= 20)
+                .unwrap_or(crate::services::memory_prompt::DEFAULT_MAX_HITS),
+            memory_inject_hit_chars: env::var("MEMORY_INJECT_HIT_CHARS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 40 && *n <= 2000)
+                .unwrap_or(crate::services::memory_prompt::DEFAULT_HIT_CHARS),
         }
     }
 }

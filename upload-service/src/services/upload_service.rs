@@ -499,7 +499,7 @@ impl UploadService {
 
         // 1. 处理文档（PDF解析 + DeepSeek提取）
         let processed = processor
-            .process_document(file_data, file_name)
+            .process_document(file_data, file_name, None)
             .await
             .map_err(|e| AppError::InternalServerError(format!("文档处理失败: {}", e)))?;
 
