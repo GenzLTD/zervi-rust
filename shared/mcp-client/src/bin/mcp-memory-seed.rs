@@ -28,24 +28,36 @@
 //!
 //! 退出码：
 //! - `0` 全部写入成功，且所有闸门都过了（没配闸门 = 没有闸门要过）；
-//! - `1` 有失败（含 denied / 超时 / recall 报错）；
+//! - `1` **没写进去**：remember 失败（denied / 超时 / 传输错）。**只管写入**；
 //! - `2` 参数或文件问题（含「闸门配了却没配 `--verify-query`」——见下）；
-//! - `3` **写得不对 / 验不出东西**：写入本身成功，但内容没通过闸门（缺主题词 /
-//!   出现禁用词），或**无从判定** —— `hits=0`（空库 / kind 全被过滤，注入块恒空、
-//!   Δ 恒 0），或 hits 非空但一条可读文本都取不到（返回形状变了，闸门读不到内容
-//!   就只会判「不匹配/未泄漏」，那是假通过）。
+//! - `3` **写进去了但这批注入不能用**：内容没通过闸门（缺主题词 / 出现禁用词）、
+//!   或用它做的校验**根本没跑成**（`recall` 超时 / 服务端 is_error / 返回错误文案），
+//!   或**无从判定** —— `hits=0`（空库 / kind 全被过滤，注入块恒空、Δ 恒 0），
+//!   或 hits 非空但一条可读文本都取不到（返回形状变了，闸门读不到内容就只会判
+//!   「不匹配/未泄漏」，那是假通过）。
 //!
-//! 最后这两种以前是 **exit 0**：闸门一声不响跳过，hook 当成「过了」—— 正是
-//! 本工具反复栽的「看起来通过、其实没测」。「没测到」不属于 exit 1（没写进去），
-//! 归 3 才和「写得不对」共用同一条语义：这批注入不能拿来跑 A/B。
+//! `1` 与 `3` 的边界是**写入有没有成功**，不是「跑没跑通」：校验阶段的所有失败
+//! 都归 3。否则 hook 看到 1 会去重灌 preload，而真实原因是校验的 recall 超时
+//! （本地嵌入冷启动，见 [`DEFAULT_VERIFY_TIMEOUT_MS`]）。
+//!
+//! `hits=0` 与「读不出文本」这两种以前是 **exit 0**：闸门一声不响跳过，hook 当成
+//! 「过了」—— 正是本工具反复栽的「看起来通过、其实没测」。
 //!
 //! 退出码 3 的单独立项不是洁癖：hook 里 `if seed; then run ab; fi` 只看得到
-//! 成功/失败，分不清「没写进去」（1）和「写进去了但不是同类岗位」（3）。
+//! 成功/失败，分不清「没写进去」（1）和「写进去了但不能用」（3）。
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use mcp_client::{Lifecycle, McpMemoryClient, McpServerSpec};
+
+/// 校验用的 recall 超时默认值。
+///
+/// **不能**复用 `DEFAULT_RECALL_TIMEOUT`（2s）：那是上传路径的预算，为的是记忆层
+/// 拖不死 `/upload`。校验场景不一样 —— 第一次 recall 要冷启动本地嵌入模型：
+/// Mac 实测空库首次直接超时（被误判成「没写进去」exit 1），热身后才 0.305s。
+/// 30s 盖得住一次本地嵌入冷启动，又不至于让流程卡死。
+const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 30_000;
 
 struct Args {
     program: String,
@@ -62,6 +74,7 @@ struct Args {
     verify_only: bool,
     dry_run: bool,
     write_timeout_ms: u64,
+    verify_timeout_ms: u64,
 }
 
 impl Args {
@@ -81,6 +94,7 @@ impl Args {
             verify_only: false,
             dry_run: false,
             write_timeout_ms: mcp_client::DEFAULT_WRITE_TIMEOUT.as_millis() as u64,
+            verify_timeout_ms: DEFAULT_VERIFY_TIMEOUT_MS,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -101,6 +115,9 @@ impl Args {
                 "--verify-only" => a.verify_only = true,
                 "--write-timeout-ms" => {
                     a.write_timeout_ms = val()?.parse().map_err(|_| "需为数字")?
+                }
+                "--verify-timeout-ms" => {
+                    a.verify_timeout_ms = val()?.parse().map_err(|_| "需为数字")?
                 }
                 "--dry-run" => a.dry_run = true,
                 "--env" => {
@@ -274,6 +291,9 @@ mcp-memory-seed —— A/B 注入前的记忆预置
                            （注意 recall 会更新 access_count/last_accessed）
   --dry-run                只打印不写入
   --write-timeout-ms <n>   单条写入超时，默认 15000
+  --verify-timeout-ms <n>  校验 recall 超时，默认 30000
+                           别调成 2000：那会让空库在本地嵌入冷启动时超时，
+                           误判成「没写进去」(exit 1)。上传路径的 2s 不适用于这里
   --program <解释器>       默认 python（应指向装了 cortex-mcp 的 venv）
   --module <模块>          默认 cortex_mcp.server
   --cwd <cortex-mcp 根>    cortex-mcp 读 .env 与包路径需要
@@ -376,7 +396,7 @@ async fn main() -> ExitCode {
                 connect_started.elapsed().as_millis()
             );
             c.with_timeouts(
-                mcp_client::DEFAULT_RECALL_TIMEOUT,
+                Duration::from_millis(args.verify_timeout_ms),
                 Duration::from_millis(args.write_timeout_ms),
             )
         }
@@ -558,8 +578,12 @@ async fn main() -> ExitCode {
                 }
             }
             Err(e) => {
+                // 验证本身没跑成（超时 / 服务端 is_error / 错误文案）。
+                // **不记 failed(1)**：1 的语义是「没写进去」，而这里写进去了、
+                // 只是没验成。两者共用一个码会让 hook 分不清「重灌」和「加超时」。
                 eprintln!("验证 recall 失败：{e:#}");
-                failed += 1;
+                eprintln!("  ⇒ exit 3（不是 1）：写入没问题，是校验没跑成 —— 先看超时/服务端");
+                gate_failed = true;
             }
         }
     }
@@ -709,5 +733,17 @@ mod tests {
     fn readable_hits_without_gates_pass() {
         let hits = vec![json!({"content": "任意内容"})];
         assert_eq!(evaluate_gates(&hits, None, None).verdict, None);
+    }
+
+    /// 校验超时默认 30s，**不能**退回上传路径的 2s。
+    /// 校验首次 recall 要冷启动本地嵌入（Mac 实测空库首次直接超时，被误判成
+    /// 「没写进去」exit 1）；30s 盖得住一次冷启动。这条锁住「别手滑改回 2000」。
+    #[test]
+    fn verify_timeout_default_is_thirty_seconds() {
+        assert_eq!(DEFAULT_VERIFY_TIMEOUT_MS, 30_000);
+        assert_ne!(
+            DEFAULT_VERIFY_TIMEOUT_MS,
+            mcp_client::DEFAULT_RECALL_TIMEOUT.as_millis() as u64
+        );
     }
 }
