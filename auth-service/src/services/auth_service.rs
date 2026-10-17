@@ -32,7 +32,8 @@ impl AuthService {
 
         // 存储到Redis，过期时间5分钟
         let key = format!("sms:{}:{}", request.code_type, request.phone);
-        redis.set_ex(&key, &code, 300).await?;
+        // 显式标注返回类型 ()，避免 never-type 回退（rustc 1.98 起在 edition 2024 迁移检查下报错）
+        redis.set_ex::<_, _, ()>(&key, &code, 300).await?;
 
         // TODO: 这里调用实际的短信服务商API发送验证码
         tracing::info!("发送验证码到 {}: {}", request.phone, code);
@@ -60,8 +61,8 @@ impl AuthService {
             _ => {}
         }
 
-        // 验证码正确，删除
-        redis.del(&key).await?;
+        // 验证码正确，删除（显式标注 ()，避免 never-type 回退）
+        redis.del::<_, ()>(&key).await?;
 
         // 查找或创建用户
         let user = User::find()
@@ -173,8 +174,8 @@ impl AuthService {
             _ => {}
         }
 
-        // 验证码正确，删除
-        redis.del(&key).await?;
+        // 验证码正确，删除（显式标注 ()，避免 never-type 回退）
+        redis.del::<_, ()>(&key).await?;
 
         // 检查手机号是否已存在
         let existing_user = User::find()
