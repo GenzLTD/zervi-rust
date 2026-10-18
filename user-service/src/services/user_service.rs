@@ -171,6 +171,11 @@ impl UserService {
             .await?
             .ok_or(AppError::NotFound("用户不存在".to_string()))?;
 
+        // 建档时 password_hash 是空串。空串不是「空密码」，不能拿空口令比对通过。
+        if password::password_is_unset(&user.password_hash) {
+            return Err(AppError::BadRequest("尚未设置密码".to_string()));
+        }
+
         // 验证旧密码
         if !password::verify_password(&request.old_password, &user.password_hash)? {
             return Err(AppError::BadRequest("原密码错误".to_string()));
@@ -187,5 +192,164 @@ impl UserService {
         user.update(db).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Statement,
+    };
+
+    async fn empty_users_db() -> DatabaseConnection {
+        let mut opt = sea_orm::ConnectOptions::new("sqlite::memory:");
+        opt.max_connections(1).min_connections(1);
+        let db = Database::connect(opt).await.unwrap();
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            r#"CREATE TABLE users (
+                id TEXT PRIMARY KEY NOT NULL,
+                phone TEXT NOT NULL UNIQUE,
+                email TEXT,
+                password_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                avatar TEXT,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"#,
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn row_count(db: &DatabaseConnection) -> u64 {
+        User::find().count(db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn profile_first_call_returns_id_eq_sub() {
+        let db = empty_users_db().await;
+        let profile = UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile.id, "sub-win-1");
+        assert_eq!(row_count(&db).await, 1);
+        let row = User::find_by_id("sub-win-1")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(password::password_is_unset(&row.password_hash));
+        assert_eq!(row.role, UserRole::Candidate);
+    }
+
+    #[tokio::test]
+    async fn profile_second_call_does_not_insert() {
+        let db = empty_users_db().await;
+        UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap();
+        let profile = UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile.id, "sub-win-1");
+        assert_eq!(row_count(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_role_is_400_and_inserts_nothing() {
+        let db = empty_users_db().await;
+        let err = UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "observer".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(row_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn phone_conflict_is_409_and_inserts_nothing() {
+        let db = empty_users_db().await;
+        UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap();
+        let err = UserService::get_profile(
+            &db,
+            "sub-win-2".into(),
+            "另一个".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::DuplicateEntry(_)));
+        assert_eq!(row_count(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn change_password_rejects_unset_hash() {
+        let db = empty_users_db().await;
+        UserService::get_profile(
+            &db,
+            "sub-win-1".into(),
+            "测试".into(),
+            "13800138000".into(),
+            "candidate".into(),
+        )
+        .await
+        .unwrap();
+        let err = UserService::change_password(
+            &db,
+            "sub-win-1".into(),
+            crate::dto::ChangePasswordRequest {
+                old_password: "old-pass".into(),
+                new_password: "new-pass".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => assert_eq!(msg, "尚未设置密码"),
+            other => panic!("应返回尚未设置密码，实际 {other:?}"),
+        }
+        let row = User::find_by_id("sub-win-1")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(password::password_is_unset(&row.password_hash));
     }
 }

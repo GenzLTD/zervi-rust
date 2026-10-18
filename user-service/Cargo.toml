@@ -47,3 +47,6 @@ dotenvy.workspace = true
 # 共享库
 common = { path = "../shared/common" }
 consul-client = { path = "../shared/consul-client" }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["sqlx-sqlite"] }

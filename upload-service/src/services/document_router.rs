@@ -291,7 +291,8 @@ mod tests {
 
     #[test]
     fn test_route_image() {
-        let router = DocumentRouter::new();
+        let mut router = DocumentRouter::new();
+        router.enable_mineru = true;
         let features = DocumentFeatures {
             is_image: true,
             is_scanned: false,

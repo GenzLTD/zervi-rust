@@ -96,10 +96,10 @@ mod tests {
     #[test]
     fn test_jwt_generation_and_verification() {
         let jwt_service = JwtService::new("test_secret".to_string(), 3600);
-        let user_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4().to_string();
 
         let token = jwt_service
-            .generate_token(user_id, "candidate", "测试用户", "13800138000")
+            .generate_token(user_id.clone(), "candidate", "测试用户", "13800138000")
             .unwrap();
 
         let claims = jwt_service.verify_token(&token).unwrap();

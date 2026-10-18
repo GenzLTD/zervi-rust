@@ -47,6 +47,47 @@ async fn health_check() -> &'static str {
     "Upload Service is healthy"
 }
 
+/// `/health` 留在鉴权外。业务路由用 `route_layer`，不把健康检查包进去。
+///
+/// 无 token 的 `GET /health` = 200；坏 token 访问 `/upload` 仍 401。
+fn app_router(state: AppState, max_request_body: usize) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let protected = Router::new()
+        .route("/upload", post(handlers::upload_single))
+        .route("/upload/batch", post(handlers::batch_upload_and_parse))
+        .route("/uploads", get(handlers::list_uploads))
+        .route("/uploads/:id", get(handlers::get_upload))
+        .route("/uploads/:id/parsed", get(handlers::get_parsed_result))
+        .route("/uploads/:id/resume-info", get(handlers::get_resume_info))
+        .route("/uploads/:id", delete(handlers::delete_upload))
+        .route("/optimize/ats-analysis", post(handlers::analyze_ats))
+        .route("/optimize/smart-rewrite", post(handlers::optimize_resume))
+        .route(
+            "/optimize/generate-word",
+            post(handlers::generate_optimized_word),
+        )
+        .route(
+            "/optimize/ats-report",
+            post(handlers::generate_ats_report_word),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt_middleware::auth_middleware,
+        ));
+
+    Router::new()
+        .route("/health", get(health_check))
+        .merge(protected)
+        // 批量数量 × 单文件大小。例如 30 × 20MB = 600MB。
+        .layer(DefaultBodyLimit::max(max_request_body))
+        .layer(cors)
+        .with_state(state)
+}
+
 /// 进程外模型服务（Ollama 协议）→ DocumentProcessor
 ///
 /// `DeepSeekClient` 打的是 `POST {DEEPSEEK_URL}/api/generate`，即 Ollama 原生协议，
@@ -264,56 +305,7 @@ async fn main() -> anyhow::Result<()> {
         max_request_body / 1024 / 1024
     );
 
-    // 配置CORS
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    // 构建路由
-    //
-    // ⚠️ `/health` 必须留在鉴权中间件**之外**：上传服务的健康检查也不带 Bearer。
-    //    用 `route_layer` 只包裹受保护子路由，使无 token 的 `GET /health` = 200，
-    //    而坏 token 访问 `/upload` 等仍 401（与 user-service 同构）。
-    let protected = Router::new()
-        // 需要JWT验证的路由
-        .route("/upload", post(handlers::upload_single))
-        .route("/upload/batch", post(handlers::batch_upload_and_parse))
-        // Phase 1: 批量上传功能 - 暂时注释（编译错误）
-        // .route("/upload/batch-resumes", post(handlers::batch_upload_resumes))
-        // .route("/upload/batch-resumes-progress", get(handlers::batch_upload_with_progress))
-        .route("/uploads", get(handlers::list_uploads))
-        .route("/uploads/:id", get(handlers::get_upload))
-        .route("/uploads/:id/parsed", get(handlers::get_parsed_result))
-        .route("/uploads/:id/resume-info", get(handlers::get_resume_info))
-        .route("/uploads/:id", delete(handlers::delete_upload))
-        // SmartResume智能优化端点
-        .route("/optimize/ats-analysis", post(handlers::analyze_ats))
-        .route("/optimize/smart-rewrite", post(handlers::optimize_resume))
-        .route(
-            "/optimize/generate-word",
-            post(handlers::generate_optimized_word),
-        )
-        .route(
-            "/optimize/ats-report",
-            post(handlers::generate_ats_report_word),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            jwt_middleware::auth_middleware,
-        ));
-
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .merge(protected)
-        // ⭐⭐⭐ 关键修复：设置 Axum multipart 的请求体大小限制
-        // 计算：批量数量 × 单文件大小 = 总限制
-        // 例如：30个文件 × 20MB = 600MB
-        .layer(DefaultBodyLimit::max(max_request_body))
-        // ⚠️ 移除 RequestBodyLimitLayer，避免覆盖 DefaultBodyLimit
-        // .layer(body_limit)
-        .layer(cors)
-        .with_state(state);
+    let app = app_router(state, max_request_body);
 
     // 启动服务器
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -397,4 +389,74 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("👋 Upload Service stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sea_orm::DatabaseConnection;
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let mut config = Config::from_env();
+        config.use_local_llm = false;
+        config.mcp_enabled = false;
+        config.jwt_secret = "upload-health-test".into();
+        config.jwt_expiration = 3600;
+        let dir = std::env::temp_dir().join("zervi-upload-health-test");
+        config.upload_dir = dir.to_string_lossy().into_owned();
+        let storage = Arc::new(LocalStorage::new(
+            config.upload_dir.clone(),
+            config.base_url.clone(),
+        ));
+        let jwt_service = JwtService::new(config.jwt_secret.clone(), config.jwt_expiration);
+        let processor = build_remote_processor(&config);
+        AppState {
+            db: DatabaseConnection::Disconnected,
+            storage,
+            jwt_service,
+            processor,
+            memory: Arc::new(MemoryLayer::disabled("router test")),
+            upload_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn health_without_token_is_200() {
+        let app = app_router(test_state(), 1024);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Upload Service is healthy");
+    }
+
+    #[tokio::test]
+    async fn upload_with_forged_token_is_401() {
+        let app = app_router(test_state(), 1024);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("authorization", "Bearer not-a-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

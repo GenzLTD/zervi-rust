@@ -99,3 +99,7 @@ rand = "0.8"
 default = []
 # 启用进程内 GGUF 推理（需 libclang；本轮不编译）
 local-llm = ["dep:llama_cpp_rs", "dep:num_cpus"]
+
+[dev-dependencies]
+# 路由测试用 oneshot
+tower = { workspace = true }

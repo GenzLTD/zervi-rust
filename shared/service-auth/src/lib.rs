@@ -34,7 +34,12 @@ pub struct ServiceTokenClaims {
 ///
 /// # Example
 /// ```
+/// use service_auth::generate_service_token;
+/// # fn run() -> anyhow::Result<()> {
 /// let token = generate_service_token("upload-service", "pyresparser", "secret")?;
+/// # let _ = token;
+/// # Ok(())
+/// # }
 /// ```
 pub fn generate_service_token(service_id: &str, target: &str, secret: &str) -> Result<String> {
     let now = Utc::now();
