@@ -1,0 +1,11 @@
+# 本目录下的脚本与清单一律用 LF 落盘，禁止 CRLF
+# 目的：Windows(core.autocrlf=true) 与 Linux 检出的字节完全一致，
+#       SHA256SUMS 才能在两侧对上。
+*.sh text eol=lf
+*.py text eol=lf
+EXPECTED_COMMIT text eol=lf
+SHA256SUMS text eol=lf
+ENV.lock text eol=lf
+README.md text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
