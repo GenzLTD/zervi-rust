@@ -208,7 +208,7 @@ async fn main() -> ExitCode {
     // ③ forget（有 id 才删）
     if let Some(id) = memory_id {
         let t = Instant::now();
-        match client.forget(&id).await {
+        match client.forget(&id, Some("steward")).await {
             Ok(true) => println!("[PASS] forget       {}ms  removed", t.elapsed().as_millis()),
             Ok(false) => println!(
                 "[PASS] forget       {}ms  not found（对端语义，非错误）",
@@ -223,7 +223,7 @@ async fn main() -> ExitCode {
 
     // ④ consolidate_memories
     let t = Instant::now();
-    match client.consolidate().await {
+    match client.consolidate(Some("steward")).await {
         Ok(v) => println!(
             "[PASS] consolidate  {}ms  {}",
             t.elapsed().as_millis(),

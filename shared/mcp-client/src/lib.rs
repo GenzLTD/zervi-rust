@@ -575,16 +575,25 @@ impl McpMemoryClient {
         classify_remember_text(&raw)
     }
 
-    /// 按 id 删除一条记忆（cortex-mcp `forget`）。
+    /// 按 id 删除一条记忆（cortex-mcp `forget`）。最低 `steward`。
+    ///
+    /// `actor_role` 非空才传给对端。空则由对端读进程环境 `CORTEX_DEFAULT_ACTOR_ROLE`；
+    /// 该默认值若是 `participant`，删除会被拒绝。
     ///
     /// 对端在删不到时返回 `"<id> not found"`（**不是错误**），所以这里用
     /// `Ok(false)` 表达「没删到」，只有调用失败才 `Err`。
-    pub async fn forget(&self, memory_id: &str) -> MemoryResult<bool> {
+    pub async fn forget(&self, memory_id: &str, actor_role: Option<&str>) -> MemoryResult<bool> {
         let mut args = serde_json::Map::new();
         args.insert(
             "memory_id".into(),
             serde_json::Value::String(memory_id.to_string()),
         );
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
         let value = self.call_tool("forget", args, self.write_timeout).await?;
         Ok(match &value {
             serde_json::Value::String(s) => !s.contains("not found"),
@@ -592,13 +601,23 @@ impl McpMemoryClient {
         })
     }
 
-    /// 元认知巩固（cortex-mcp `consolidate_memories`）。
+    /// 元认知巩固（cortex-mcp `consolidate_memories`）。最低 `steward`。
     ///
     /// ⚠️ 工具名是 `consolidate_memories`，不是 `consolidate` —— 以真机
     /// cortex-mcp 的 `tools/list` 为准（T1.0 夹具当时写成 `consolidate`，
     /// 已同步修正，否则会 `tool not found`）。
-    pub async fn consolidate(&self) -> MemoryResult<serde_json::Value> {
-        self.call_tool("consolidate_memories", serde_json::Map::new(), self.write_timeout)
+    ///
+    /// `actor_role` 的传递规则与 [`Self::forget`] 相同。操作者进程的
+    /// `participant` 默认值不够，调用方要显式传 `steward`。
+    pub async fn consolidate(&self, actor_role: Option<&str>) -> MemoryResult<serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
+        self.call_tool("consolidate_memories", args, self.write_timeout)
             .await
     }
 }
