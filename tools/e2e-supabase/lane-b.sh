@@ -122,9 +122,11 @@ GATEWAY_JWKS_URL="$JWKS_URL" GATEWAY_JWT_SECRET="gateway-secret-not-used-for-es2
   "$BIN" >>"$GWLOG" 2>&1 &
 GW_PID=$!
 
-for _ in $(seq 1 40); do
+i=0
+while [ "$i" -lt 40 ]; do
   curl -s -m 2 -o /dev/null "http://127.0.0.1:$GW_PORT/health" && break
   sleep 0.5
+  i=$((i + 1))
 done
 curl -s -m 2 -o /dev/null "http://127.0.0.1:$GW_PORT/health" || {
   bad "gateway_up" ":$GW_PORT 未监听"

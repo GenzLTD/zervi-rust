@@ -78,12 +78,13 @@ for c in git cargo rustc curl sha256sum; do
     FAILED=1
   fi
 done
-# lane-a / lane-b 内部还会用到这些，缺一个就会跑到一半失败，提前暴露
-for c in grep sed sort awk tee seq; do
+# lane-a / lane-b 内部实际用到的外部命令。tee、seq 已从脚本中移除
+# （say 改内建 printf 双写；等待循环改 while 计数），不再列为依赖。
+for c in grep sed sort awk; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "OK   $c"
   else
-    echo "MISS $c（lane-a/lane-b 会用到）"
+    echo "MISS $c（lane-a/lane-b 运行需要；包本身无误，是环境缺这个命令）"
     FAILED=1
   fi
 done
