@@ -15,4 +15,5 @@
 pub mod client;
 pub mod jws;
 pub mod jwt;
+pub mod routes;
 pub mod state_machine;

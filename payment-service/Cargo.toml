@@ -24,6 +24,13 @@ reqwest.workspace = true
 # v0.4 数据层（gen_schema bin 与 routes 共用；common 含 AppState / 全量 entity）
 common = { package = "common", path = "../shared/common" }
 sea-orm.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dotenvy.workspace = true
 
 # JWS 验签三件套（本阶段核心）
 base64 = "0.22"

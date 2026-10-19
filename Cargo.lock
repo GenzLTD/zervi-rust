@@ -2454,8 +2454,11 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 name = "payment-service"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
+ "chrono",
  "common",
+ "dotenvy",
  "jsonwebtoken",
  "reqwest",
  "ring",
@@ -2463,6 +2466,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
  "x509-parser",
 ]
 

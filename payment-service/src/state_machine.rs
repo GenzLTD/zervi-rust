@@ -34,6 +34,7 @@ use thiserror::Error;
 /// 15 种 notificationType 全集（Apple 官方）。
 pub mod notification_type {
     // —— 落状态机 ——
+    pub const SUBSCRIBED: &str = "SUBSCRIBED";
     pub const DID_RENEW: &str = "DID_RENEW";
     pub const DID_FAIL_TO_RENEW: &str = "DID_FAIL_TO_RENEW";
     pub const DID_CHANGE_RENEWAL_STATUS: &str = "DID_CHANGE_RENEWAL_STATUS";
@@ -140,6 +141,11 @@ pub fn transition(
     };
 
     let action = match notification_type {
+        // SUBSCRIBED（首次订阅/重新订阅）：signedTransactionInfo 已是完整购买。
+        // routes 层注意：webhook 无 user_id 上下文，行不存在时只落 raw 留痕
+        //（等 verify/restore 绑定），行存在则刷新 expires/tier —— apply 层处理。
+        notification_type::SUBSCRIBED => activate(tx, renewal, true)?,
+
         t if t == notification_type::DID_RENEW => activate(tx, renewal, true)?,
 
         notification_type::DID_FAIL_TO_RENEW => match subtype {
@@ -306,6 +312,19 @@ mod tests {
         );
         assert_eq!(t.environment, "Sandbox");
         assert!(!t.unknown_type);
+    }
+
+    #[test]
+    fn subscribed_activates() {
+        // 首次订阅 / 重新订阅：与 DID_RENEW 同为 Activate 语义。
+        for sub in [None, Some("INITIAL_BUY"), Some("RESUBSCRIBE")] {
+            let t = act(notification_type::SUBSCRIBED, sub, &tx("supporter_monthly"), None);
+            assert!(
+                matches!(&t.action, SubscriptionAction::Activate { tier, .. } if tier == "supporter"),
+                "SUBSCRIBED {sub:?} 应产出 Activate"
+            );
+            assert!(!t.unknown_type);
+        }
     }
 
     #[test]

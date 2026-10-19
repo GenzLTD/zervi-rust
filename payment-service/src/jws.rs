@@ -33,7 +33,7 @@ use base64::Engine as _;
 use ring::digest::{digest, SHA256};
 use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED as ES256_ALG};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
@@ -102,7 +102,7 @@ struct JwsHeader {
 
 /// 15 种 notificationType 中必须落状态机的 8 种之外的常量也照单全收，
 /// 是否处理由 state_machine 决定，本层只负责"可信地解码"。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodedNotification {
     pub notification_type: String,
@@ -114,7 +114,7 @@ pub struct DecodedNotification {
     pub data: NotificationData,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationData {
     pub app_apple_id: i64,
@@ -131,7 +131,7 @@ pub struct NotificationData {
 // 内层：JWSTransactionInfoDecodedPayload（字段 snake_case）
 // ============================================================
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransactionInfo {
     pub transaction_id: String,
     pub original_transaction_id: String,
@@ -178,7 +178,7 @@ pub struct TransactionInfo {
 // 内层：JWSRenewalInfoDecodedPayload（字段 snake_case）
 // ============================================================
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RenewalInfo {
     pub original_transaction_id: String,
     #[serde(default)]
