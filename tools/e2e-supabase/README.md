@@ -92,6 +92,25 @@ summary / cases / names_sha256 / PASS / FAIL
 `os`、`arch`、`bash`、`git` 允许不同；`code_tree`、`names_sha256`、`cases` 必须相同。
 若有差异，先对齐再谈 B 阶段。
 
+### A 阶段实测：双向对拍已通过（2026-10-19）
+
+| 项 | 发起方 | 验收方 |
+|---|---|---|
+| os | MINGW64_NT-10.0-26300 | MSYS_NT-10.0-26300 |
+| rustc | 1.98.1 (`x86_64-pc-windows-gnu`) | 1.95.0 (`x86_64-pc-windows-msvc`) |
+| git / bash | 2.55.0 / 5.3.15 | 2.54.0 / 5.3.9 |
+| python | 3.13.14 | 3.13.13 |
+| code_tree | `06707bcc…` | `06707bcc…` ✅ |
+| names_sha256 | `7039580b…451e82` | `7039580b…451e82` ✅ |
+| 结果 | 21 passed / 0 failed | 21 passed / 0 failed ✅ |
+
+**两个工具链版本、两种 host（gnu vs msvc）跑出同一批断言与同一结果**，说明这 21 项不依赖编译器实现细节。
+这也是为什么 `ENV.lock` 把 rustc 标成 SHOULD 而非 MUST。
+
+关于编译缓存：如果本机已有同一 commit 的 `target/`，cargo 会复用产物（`Finished` 只需一两分钟）。
+这不影响结论——cargo 的 fingerprint 包含源码与 rustc 版本，不匹配会自动重编。
+想排除缓存影响可 `cargo clean -p api-gateway` 后重跑，`names_sha256` 不应变化。
+
 ---
 
 ## 四、B 阶段的凭据约定
@@ -148,6 +167,7 @@ A/B 全绿的含义是：**验签、身份映射、伪造头剥离、四条负�
 | `FATAL: 被测代码与基线不一致` | 你改过代码 | 别改，或 `ALLOW_COMMIT_DRIFT=1`（会导致结果不可比） |
 | `sha256sum -c` 失败 | 文件被编辑 / 换行被改 | 重新 `git checkout -- tools/e2e-supabase` |
 | `CRLF 换行` | Windows 检出配置 | 本目录 `.gitattributes` 已锁 `eol=lf`，`git config core.autocrlf false` 后重检 |
+| `od: command not found` | 旧版 verify.sh 用 `od` 判 BOM，精简版 Git for Windows 没有 | 已改为解释器读字节并 fail-closed，更新到 `a4bee1c` 之后的 commit |
 | `缺少命令 cargo` | 未装 Rust | 装 1.80+ |
 | `dlltool.exe: program not found` | Windows 用的是 `*-pc-windows-gnu` 工具链，缺 MinGW binutils | 脚本会自动探测常见路径；仍失败则 `EXTRA_PATH=<mingw bin>`，或装 MinGW-w64，或 `rustup default stable-x86_64-pc-windows-msvc` |
 | `:3333 未监听` | 端口被占 / 二进制未构建 | 先 `cargo build -p api-gateway`；或 `GW_PORT=13333` 双方同步覆盖 |

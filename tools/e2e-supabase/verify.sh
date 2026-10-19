@@ -24,17 +24,36 @@ echo ""
 
 echo "############ 2/4 换行与编码 ############"
 CR_BAD=0
-for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/EXPECTED_COMMIT "$HERE"/SHA256SUMS; do
-  [ -f "$f" ] || continue
+# 直接遍历 SHA256SUMS 的清单，保证"被校验的文件"与"被检查编码的文件"是同一集合，
+# 避免清单里有、这里漏检（ENV.lock 就曾被漏掉）。
+CHECK_LIST="$(awk 'NF>=2 {print $NF}' "$HERE/SHA256SUMS" 2>/dev/null)"
+# SHA256SUMS 不包含自身，单独补进来
+case " $CHECK_LIST " in
+  *" SHA256SUMS "*) ;;
+  *) CHECK_LIST="$CHECK_LIST SHA256SUMS" ;;
+esac
+if [ -z "$CHECK_LIST" ]; then
+  echo "FAIL: 无法从 SHA256SUMS 读取文件列表"
+  CR_BAD=1
+fi
+for name in $CHECK_LIST; do
+  f="$HERE/$name"
+  [ -f "$f" ] || { echo "FAIL: 清单中的文件不存在 -> $name"; CR_BAD=1; continue; }
   if grep -q $'\r' "$f" 2>/dev/null; then
-    echo "FAIL: CRLF 换行 -> $(basename "$f")"
+    echo "FAIL: CRLF 换行 -> $name"
     CR_BAD=1
   fi
-  if [ "$(head -c3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
-    echo "FAIL: UTF-8 BOM -> $(basename "$f")"
+  # BOM 用解释器读前 3 字节判定：od 在精简版 Git for Windows 里可能不存在，
+  # 且缺失时必须报错而不是静默放过（fail-closed）。
+  if ! BOM="$("$PY" -c 'import sys; print("BOM" if open(sys.argv[1], "rb").read(3) == b"\xef\xbb\xbf" else "OK")' "$f" 2>/dev/null)"; then
+    echo "FAIL: BOM 探测无法执行 -> $name"
+    CR_BAD=1
+  elif [ "$BOM" = "BOM" ]; then
+    echo "FAIL: UTF-8 BOM -> $name"
     CR_BAD=1
   fi
 done
+echo "已检查 $(( $(printf '%s\n' $CHECK_LIST | wc -l | tr -d ' ') )) 个文件"
 [ "$CR_BAD" -eq 0 ] && echo "OK: 全部 LF、无 BOM" || FAILED=1
 echo ""
 
@@ -56,6 +75,15 @@ for c in git cargo rustc curl sha256sum; do
     echo "OK   $c"
   else
     echo "MISS $c"
+    FAILED=1
+  fi
+done
+# lane-a / lane-b 内部还会用到这些，缺一个就会跑到一半失败，提前暴露
+for c in grep sed sort awk tee seq; do
+  if command -v "$c" >/dev/null 2>&1; then
+    echo "OK   $c"
+  else
+    echo "MISS $c（lane-a/lane-b 会用到）"
     FAILED=1
   fi
 done
