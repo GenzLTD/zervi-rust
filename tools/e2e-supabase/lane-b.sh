@@ -61,7 +61,7 @@ say "=== 环境 ==="
 say "base_commit $BASE_COMMIT"
 say "head_commit $(git -C "$REPO" rev-parse HEAD)"
 say "code_tree   $(git -C "$REPO" rev-parse "${BASE_COMMIT}^{tree}")"
-say "binary      $(ls -lh "$BIN" 2>/dev/null | awk '{print $5, $6, $7, $8}')"
+say "binary      $BIN ($(wc -c < "$BIN" 2>/dev/null | tr -d ' ') bytes)"
 say "jwks        $JWKS_URL"
 
 assert_commit || exit 2
@@ -85,7 +85,10 @@ fi
 # ---------- 2) 取 token ----------
 if [ -n "${SUPABASE_ACCESS_TOKEN:-}" ]; then
   TOKEN="$SUPABASE_ACCESS_TOKEN"
-  say "token  来自 SUPABASE_ACCESS_TOKEN"
+  say "token  来自 SUPABASE_ACCESS_TOKEN（跳过密码登录）"
+  # 与密码登录路径共用同一判定项名，保证两条路径的项集合恒为 13，
+  # verdict_sha256 才可跨路径比对。语义 = "已取得可用凭据"。
+  ok "signin"
 else
   : "${SUPABASE_ANON_KEY:?需要 SUPABASE_ANON_KEY 或 SUPABASE_ACCESS_TOKEN}"
   : "${TEST_EMAIL:?需要 TEST_EMAIL 或 SUPABASE_ACCESS_TOKEN}"
