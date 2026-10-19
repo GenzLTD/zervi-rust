@@ -100,3 +100,46 @@ require_cmd() {
   done
   return $missing
 }
+
+# ---------- 5) Windows GNU 工具链补齐 ----------
+# rustc host 为 *-pc-windows-gnu 时，链接 phase 需要 MinGW 的 dlltool.exe；
+# 它通常不在 PATH 里。此处自动探测，找不到才报错（Linux/macOS/MSVC 直接跳过）。
+ensure_mingw_toolchain() {
+  local host
+  host="$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')"
+  case "$host" in
+    *windows-gnu) ;;
+    *) return 0 ;;
+  esac
+  if command -v dlltool >/dev/null 2>&1 || command -v dlltool.exe >/dev/null 2>&1; then
+    return 0
+  fi
+  local c
+  for c in \
+    "$HOME/.workbuddy/binaries/w64devkit/bin" \
+    "/c/Users/${USER:-${USERNAME:-none}}/.workbuddy/binaries/w64devkit/bin" \
+    "/d/ServBay/packages/mingw64/bin" \
+    "/c/msys64/mingw64/bin" \
+    "/c/mingw64/bin" \
+    "/mingw64/bin"; do
+    if [ -x "$c/dlltool.exe" ] || [ -x "$c/dlltool" ]; then
+      export PATH="$c:$PATH"
+      echo "INFO: 检测到 MinGW 工具链，已补入 PATH -> $c"
+      return 0
+    fi
+  done
+  local rb
+  rb="$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$host/bin"
+  if [ -x "$rb/dlltool.exe" ] || [ -x "$rb/dlltool" ]; then
+    export PATH="$rb:$PATH"
+    echo "INFO: 检测到 rustlib binutils，已补入 PATH -> $rb"
+    return 0
+  fi
+  echo "FATAL: host=$host 编译需要 dlltool，但系统里找不到。" >&2
+  echo "  三选一：" >&2
+  echo "  1) 安装 MinGW-w64（或 w64devkit），把其 bin 目录加入 PATH" >&2
+  echo "  2) 设置 EXTRA_PATH=<mingw bin 目录> 后重跑" >&2
+  echo "  3) 用 MSVC 工具链：rustup default stable-x86_64-pc-windows-msvc" >&2
+  return 1
+}
+

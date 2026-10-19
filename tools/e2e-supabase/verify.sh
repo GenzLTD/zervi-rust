@@ -59,6 +59,13 @@ for c in git cargo rustc curl sha256sum; do
     FAILED=1
   fi
 done
+if command -v rustc >/dev/null 2>&1; then
+  if ensure_mingw_toolchain; then
+    echo "OK   windows-gnu 工具链（或不需要）"
+  else
+    echo "WARN 缺少 dlltool：lane-a 编译阶段会失败，按上面提示补齐后再跑"
+  fi
+fi
 echo ""
 
 if [ "$FAILED" -eq 0 ]; then

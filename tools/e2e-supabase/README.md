@@ -149,6 +149,7 @@ A/B 全绿的含义是：**验签、身份映射、伪造头剥离、四条负�
 | `sha256sum -c` 失败 | 文件被编辑 / 换行被改 | 重新 `git checkout -- tools/e2e-supabase` |
 | `CRLF 换行` | Windows 检出配置 | 本目录 `.gitattributes` 已锁 `eol=lf`，`git config core.autocrlf false` 后重检 |
 | `缺少命令 cargo` | 未装 Rust | 装 1.80+ |
+| `dlltool.exe: program not found` | Windows 用的是 `*-pc-windows-gnu` 工具链，缺 MinGW binutils | 脚本会自动探测常见路径；仍失败则 `EXTRA_PATH=<mingw bin>`，或装 MinGW-w64，或 `rustup default stable-x86_64-pc-windows-msvc` |
 | `:3333 未监听` | 端口被占 / 二进制未构建 | 先 `cargo build -p api-gateway`；或 `GW_PORT=13333` 双方同步覆盖 |
 | `no such file api-gateway.exe` | 未编译 | `cargo build -p api-gateway` |
 

@@ -11,6 +11,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib.sh"
 
 require_cmd git cargo rustc || exit 2
+ensure_mingw_toolchain || exit 2
 
 OUT="$HERE/out"
 mkdir -p "$OUT"
