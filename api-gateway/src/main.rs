@@ -159,11 +159,29 @@ async fn route_to_application_service(
     route_to_service(&state, "application-service", 3005, &path, req).await
 }
 
+/// `/api/v1/slice/*` —— 终端侧的 job_match 适配器入口。
+///
+/// 与 `/v1/ask` 共用 `authenticate_and_stamp`：先验 token，再注入
+/// `X-Actor-Sub`（原始 sub）与 `X-User-Id`（sha256(sub)）。此前这条路由是
+/// **纯透传**：匿名也能写简历、读收件箱，且下游拿不到任何身份 ——
+/// GFCC 1.3.0 要求 `job_match` 结果只能以 `weight: auxiliary` 喂
+/// `identity.capability_trace`，没有 actor 就无法归因，适配器等于不可用。
 async fn route_to_jobfirst_slice(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    req: Request,
+    uri: Uri,
+    mut req: Request,
 ) -> Response {
+    if let Err(resp) = tatha::authenticate_and_stamp(&mut req).await {
+        tracing::warn!("🚫 /api/v1/slice/{} rejected: no identity", path);
+        return resp;
+    }
+    // `Path` 只给出路径段，query 会被丢掉；`matches` / `inbox` 都靠 query 传
+    // `resume_id`，不补回去下游就会报「missing field resume_id」。
+    let path = match uri.query() {
+        Some(q) => format!("{}?{}", path, q),
+        None => path,
+    };
     route_to_service(&state, "jobfirst-slice-service", 3005, &path, req).await
 }
 
@@ -402,6 +420,23 @@ mod tests {
         encode(
             &Header::new(Algorithm::HS256),
             &Value::Object(claims),
+            &EncodingKey::from_secret(HS_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn hs_token_with_role(sub: &str, role: &str) -> String {
+        let now = now_secs();
+        let claims = json!({
+            "sub": sub,
+            "role": role,
+            "aud": "authenticated",
+            "iat": now,
+            "exp": now + 3600,
+        });
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
             &EncodingKey::from_secret(HS_SECRET.as_bytes()),
         )
         .unwrap()
@@ -654,6 +689,59 @@ mod tests {
         assert_ne!(
             body.get("x-user-id").and_then(|v| v.as_str()),
             Some("user-win-001")
+        );
+    }
+
+    /// token 里的八角梯角色注入 `X-Actor-Role`；客户端自带的同名头被丢掉。
+    /// 不在梯上的角色（如 candidate）不注入，避免把市场外字符串当成 participant。
+    #[tokio::test]
+    async fn ask_stamps_ladder_role_and_strips_client_role() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("GATEWAY_JWT_SECRET", HS_SECRET);
+        std::env::remove_var("GATEWAY_JWKS_URL");
+
+        let upstream = spawn(echo_router()).await;
+        std::env::set_var("TATHA_BASE_URL", &upstream);
+        std::env::set_var("TATHA_SERVICE_TOKEN", "svc-test");
+
+        let gw = spawn(app()).await;
+        let client = reqwest::Client::new();
+        let body: Value = client
+            .post(format!("{}/v1/ask", gw))
+            .header(
+                "authorization",
+                format!("Bearer {}", hs_token_with_role("s1", "Participant")),
+            )
+            .header("X-Actor-Role", "petitioner")
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body.get("x-actor-role").and_then(|v| v.as_str()),
+            Some("participant")
+        );
+
+        let body: Value = client
+            .post(format!("{}/v1/ask", gw))
+            .header(
+                "authorization",
+                format!("Bearer {}", hs_token_with_role("s1", "candidate")),
+            )
+            .header("X-Actor-Role", "steward")
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            body.get("x-actor-role").is_none(),
+            "梯外角色不得注入，客户端伪造值也不得留下: {body:?}"
         );
     }
 

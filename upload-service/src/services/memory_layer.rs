@@ -118,6 +118,7 @@ impl MemoryLayer {
         query: &str,
         kind: Option<&str>,
         k: usize,
+        actor_role: Option<&str>,
     ) -> Result<Vec<MemoryHit>, String> {
         match &self.inner {
             None => Err(self
@@ -128,7 +129,7 @@ impl MemoryLayer {
                 if !client.is_alive() {
                     return Err("记忆层子进程已退出（重启策略未实现）".to_string());
                 }
-                client.recall(query, kind, k).await
+                client.recall(query, kind, k, actor_role).await
             }
         }
     }
@@ -140,6 +141,7 @@ impl MemoryLayer {
         kind: Option<&str>,
         metadata: Option<serde_json::Value>,
         importance: Option<f64>,
+        actor_role: Option<&str>,
     ) -> Result<String, String> {
         match &self.inner {
             None => Err(self
@@ -150,7 +152,7 @@ impl MemoryLayer {
                 if !client.is_alive() {
                     return Err("记忆层子进程已退出（重启策略未实现）".to_string());
                 }
-                client.remember(content, kind, metadata, importance).await
+                client.remember(content, kind, metadata, importance, actor_role).await
             }
         }
     }
@@ -174,10 +176,10 @@ mod tests {
         let layer = MemoryLayer::disabled("MCP_ENABLED=false（测试）");
         assert!(!layer.is_enabled());
 
-        let err = layer.recall("任意查询", None, 5).await.unwrap_err();
+        let err = layer.recall("任意查询", None, 5, None).await.unwrap_err();
         assert!(err.contains("MCP_ENABLED=false"), "实际原因: {err}");
 
-        let err = layer.remember("内容", Some("episodic"), None, None).await.unwrap_err();
+        let err = layer.remember("内容", Some("episodic"), None, None, None).await.unwrap_err();
         assert!(err.contains("MCP_ENABLED=false"), "实际原因: {err}");
     }
 
@@ -201,7 +203,7 @@ mod tests {
         std::env::remove_var("MCP_CONNECT_TIMEOUT_MS");
 
         assert!(!layer.is_enabled());
-        let err = layer.recall("q", None, 5).await.unwrap_err();
+        let err = layer.recall("q", None, 5, None).await.unwrap_err();
         assert!(err.contains("记忆层启动失败"), "实际原因: {err}");
         // 子进程都拉不起来时必须**快速失败**，不能卡满 connect timeout
         assert!(started.elapsed().as_secs() < 3, "耗时 {:?}", started.elapsed());

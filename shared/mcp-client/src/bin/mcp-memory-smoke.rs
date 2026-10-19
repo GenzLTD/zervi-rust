@@ -147,6 +147,7 @@ async fn main() -> ExitCode {
                 "privacy_tier": "public",
             })),
             Some(0.5),
+            Some("participant"),
         )
         .await
     {
@@ -163,7 +164,7 @@ async fn main() -> ExitCode {
 
     // ② recall（带超时上限）
     let t = Instant::now();
-    match client.recall(&marker, Some("episodic"), 5).await {
+    match client.recall(&marker, Some("episodic"), 5, Some("observer")).await {
         Ok(hits) => {
             // 注意：真实 cortex-mcp 的 recall 会走向量检索，命中条数取决于 embedding，
             // 这里不把「必须命中」当断言，只断言调用在超时内返回。
@@ -207,7 +208,7 @@ async fn main() -> ExitCode {
     // ③ forget（有 id 才删）
     if let Some(id) = memory_id {
         let t = Instant::now();
-        match client.forget(&id).await {
+        match client.forget(&id, Some("steward")).await {
             Ok(true) => println!("[PASS] forget       {}ms  removed", t.elapsed().as_millis()),
             Ok(false) => println!(
                 "[PASS] forget       {}ms  not found（对端语义，非错误）",
@@ -222,7 +223,7 @@ async fn main() -> ExitCode {
 
     // ④ consolidate_memories
     let t = Instant::now();
-    match client.consolidate().await {
+    match client.consolidate(Some("steward")).await {
         Ok(v) => println!(
             "[PASS] consolidate  {}ms  {}",
             t.elapsed().as_millis(),

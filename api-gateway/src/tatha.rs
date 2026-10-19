@@ -66,6 +66,19 @@ const SUPABASE_AUDIENCE: &str = "authenticated";
 const X_USER_PREFIX: &str = "x-user-";
 /// memory.recall 的身份头。不是 `x-user-*`，前缀剥离覆盖不到，必须单独清掉再重写。
 const X_ACTOR_SUB: &str = "x-actor-sub";
+/// 八角梯角色。客户端自带的同名头同样可伪造，必须先剥再按 token 重写。
+const X_ACTOR_ROLE: &str = "x-actor-role";
+/// 与 `gfcc/contracts/roles.v1.json` 的 `role_enum` 同序。下标越大权限越高。
+const ROLE_LADDER: [&str; 8] = [
+    "observer",
+    "participant",
+    "experimenter",
+    "proposer",
+    "steward",
+    "organizer",
+    "actor",
+    "petitioner",
+];
 /// JWKS 缓存寿命，对齐 looma `PyJWKClient(lifespan=600)`。
 /// 缓存是硬要求：不得每请求拉网（ADR-0012 D1.1）。
 const JWKS_TTL: Duration = Duration::from_secs(600);
@@ -89,6 +102,15 @@ struct GatewayClaims {
     /// 可选：签发侧写入的订阅档位；缺省回落 `GATEWAY_DEFAULT_TIER`，再缺省 `free`
     #[serde(default)]
     tier: Option<String>,
+    /// zervi-auth 市场角色，取值是八角梯 id。不在梯上的值视为没有角色。
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// 只接受八角梯上的角色。大小写不敏感；`candidate` 一类市场外的字符串返回 None。
+fn canonical_ladder_role(raw: Option<&str>) -> Option<&'static str> {
+    let raw = raw?.trim().to_ascii_lowercase();
+    ROLE_LADDER.iter().copied().find(|role| *role == raw)
 }
 
 /// 解析档位：只认 free/basic/pro，其余一律按 free（拒绝放宽）。
@@ -371,15 +393,93 @@ async fn verify_bearer(authorization: Option<&HeaderValue>) -> Option<GatewayCla
     }
 }
 
-/// `POST /v1/ask` —— 校验后转发到 Tatha 主仓。
-pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
-    // 1) 网关鉴权：失败即拒，不转发
+/// 校验 bearer 并就地重写身份头（ADR-0012 D2）。
+///
+/// `/v1/ask` 与 `/api/v1/slice/*` 共用这一个判定点：终端里任何需要 `actor_sub`
+/// 的下游（memory、job_match）都从这里取身份，不各自解析 token。
+/// 成功返回 `(uid_hash, tier)`；失败返回可直接回写的 401 响应。
+pub(crate) async fn authenticate_and_stamp(
+    req: &mut Request,
+) -> Result<(String, &'static str), Response> {
     let claims = match verify_bearer(req.headers().get(header::AUTHORIZATION)).await {
         Some(claims) => claims,
         None => {
-            warn!("🚫 /v1/ask rejected: missing or invalid bearer token");
-            return (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response();
+            warn!("🚫 rejected: missing or invalid bearer token");
+            return Err(
+                (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response(),
+            );
         }
+    };
+
+    // 空白 sub 无法充当 memory.recall 的 actor，401 且不转发。
+    let actor = claims.sub.trim();
+    if actor.is_empty() {
+        warn!("🚫 rejected: token has empty sub");
+        return Err((StatusCode::UNAUTHORIZED, "missing sub").into_response());
+    }
+    let actor_header = match HeaderValue::from_str(actor) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("🚫 rejected: sub is not a valid header value");
+            return Err((StatusCode::UNAUTHORIZED, "invalid sub").into_response());
+        }
+    };
+    let uid = stable_user_id(&claims.sub);
+    let tier = resolve_tier(&claims);
+
+    let headers = req.headers_mut();
+    // 用户 token 不透传下游：下游只认网关注入的身份头（或服务凭据）。
+    headers.remove(header::AUTHORIZATION);
+
+    // 剥离客户端自带的 `x-user-*` 头（P0）：
+    // 身份注入是**条件性**的 —— `X-User-Email-Hash` 仅在 token 带 email 时
+    // 写入；不清理的话，持「无 email claim 的合法 token」（D2 明确允许的小
+    // 程序-only 用户）即可自带 `X-User-Email-Hash: <任意>` 直通下游。该头是
+    // 跨端关联键，放任等于把身份挂到别人的跨端身份上 —— 越权，不是可用性问题。
+    //
+    // 按前缀清理而非逐个点名：将来新增 `x-user-*` 头时不会重蹈覆辙。
+    let forged: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| k.as_str().starts_with(X_USER_PREFIX))
+        .cloned()
+        .collect();
+    for k in forged {
+        headers.remove(k);
+    }
+    // 客户端自带的原始 sub / 角色一律丢掉，只放网关从 token 取出的那一份。
+    headers.remove(X_ACTOR_SUB);
+    headers.remove(X_ACTOR_ROLE);
+
+    if let Ok(v) = HeaderValue::from_str(&uid) {
+        headers.insert("X-User-Id", v);
+    }
+    headers.insert(X_ACTOR_SUB, actor_header);
+    if let Some(role) = canonical_ladder_role(claims.role.as_deref()) {
+        headers.insert(X_ACTOR_ROLE, HeaderValue::from_static(role));
+    }
+    // 无真实邮箱（小程序-only 用户）时**不注入**该头 —— 上面的剥离已保证它
+    // 不会以客户端携带的值漏出，从而维持 D2 的 email_hash=None 语义
+    if let Some(email) = claims
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        if let Ok(v) = HeaderValue::from_str(&email_hash(email)) {
+            headers.insert("X-User-Email-Hash", v);
+        }
+    }
+    headers.insert("X-User-Tier", HeaderValue::from_static(tier));
+
+    Ok((uid, tier))
+}
+
+/// `POST /v1/ask` —— 校验后转发到 Tatha 主仓。
+pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
+    // 1) 网关鉴权 + 身份头重写：与 /api/v1/slice/* 共用同一条通路
+    let (uid, tier) = match authenticate_and_stamp(&mut req).await {
+        Ok(stamped) => stamped,
+        Err(resp) => return resp,
     };
 
     // 2) 上游地址：未配则 503，不放行
@@ -395,76 +495,21 @@ pub async fn ask(State(state): State<AppState>, mut req: Request) -> Response {
         }
     };
 
-    // 3) 重写身份头（ADR-0012 D2）：稳定主键 + 原始 sub + 可选邮箱哈希，不透传用户 token。
-    //    空白 sub 无法充当 memory.recall 的 actor，401 且不转发。
-    let actor = claims.sub.trim();
-    if actor.is_empty() {
-        warn!("🚫 /v1/ask rejected: token has empty sub");
-        return (StatusCode::UNAUTHORIZED, "missing sub").into_response();
-    }
-    let actor_header = match HeaderValue::from_str(actor) {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("🚫 /v1/ask rejected: sub is not a valid header value");
-            return (StatusCode::UNAUTHORIZED, "invalid sub").into_response();
-        }
-    };
-    let uid = stable_user_id(&claims.sub);
-    let tier = resolve_tier(&claims);
-    {
-        let headers = req.headers_mut();
-        headers.remove(header::AUTHORIZATION);
-
-        // 剥离客户端自带的 `x-user-*` 头（P0）：
-        // 身份注入是**条件性**的 —— `X-User-Email-Hash` 仅在 token 带 email 时
-        // 写入；不清理的话，持「无 email claim 的合法 token」（D2 明确允许的小
-        // 程序-only 用户）即可自带 `X-User-Email-Hash: <任意>` 直通下游。该头是
-        // 跨端关联键，放任等于把身份挂到别人的跨端身份上 —— 越权，不是可用性问题。
-        //
-        // 按前缀清理而非逐个点名：将来新增 `x-user-*` 头时不会重蹈覆辙。
-        let forged: Vec<HeaderName> = headers
-            .keys()
-            .filter(|k| k.as_str().starts_with(X_USER_PREFIX))
-            .cloned()
-            .collect();
-        for k in forged {
-            headers.remove(k);
-        }
-        // 客户端自带的原始 sub 一律丢掉，只放网关从 token 取出的那一份。
-        headers.remove(X_ACTOR_SUB);
-
-        if let Ok(v) = HeaderValue::from_str(&uid) {
-            headers.insert("X-User-Id", v);
-        }
-        headers.insert(X_ACTOR_SUB, actor_header);
-        // 无真实邮箱（小程序-only 用户）时**不注入**该头 —— 上面的剥离已保证它
-        // 不会以客户端携带的值漏出，从而维持 D2 的 email_hash=None 语义
-        if let Some(email) = claims
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-        {
-            if let Ok(v) = HeaderValue::from_str(&email_hash(email)) {
-                headers.insert("X-User-Email-Hash", v);
+    // 3) 下游服务凭据（用户 token 已在 stamp 阶段剥离，不透传）
+    match env_nonempty(ENV_SERVICE_TOKEN) {
+        Some(t) => match HeaderValue::from_str(&format!("Bearer {}", t)) {
+            Ok(v) => {
+                req.headers_mut().insert(header::AUTHORIZATION, v);
             }
-        }
-        headers.insert("X-User-Tier", HeaderValue::from_static(tier));
-        match env_nonempty(ENV_SERVICE_TOKEN) {
-            Some(t) => match HeaderValue::from_str(&format!("Bearer {}", t)) {
-                Ok(v) => {
-                    headers.insert(header::AUTHORIZATION, v);
-                }
-                Err(_) => error!(
-                    "🚫 /v1/ask: {} contains invalid header bytes",
-                    ENV_SERVICE_TOKEN
-                ),
-            },
-            None => warn!(
-                "⚠️  {} not set; forwarding /v1/ask without downstream credential",
+            Err(_) => error!(
+                "🚫 /v1/ask: {} contains invalid header bytes",
                 ENV_SERVICE_TOKEN
             ),
-        }
+        },
+        None => warn!(
+            "⚠️  {} not set; forwarding /v1/ask without downstream credential",
+            ENV_SERVICE_TOKEN
+        ),
     }
 
     let target = format!("{}/v1/ask", base);
@@ -597,6 +642,7 @@ mod tests {
                 sub: SUB_A.to_string(),
                 email: None,
                 tier: Some(input.to_string()),
+                role: None,
             };
             assert_eq!(resolve_tier(&claims), want, "tier={:?}", input);
         }

@@ -256,6 +256,52 @@ pub struct McpMemoryClient {
     write_timeout: Duration,
 }
 
+/// `is_error=true` 时取出工具错误文案。角色闸门和非法 kind 都走这条，不进成功 payload。
+fn tool_error_message(tool: &str, result: &rmcp::model::CallToolResult) -> Option<String> {
+    if result.is_error != Some(true) {
+        return None;
+    }
+    let detail = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "MCP 工具 `{}` 返回错误: {}",
+        tool,
+        if detail.is_empty() {
+            "(无详情)"
+        } else {
+            &detail
+        }
+    ))
+}
+
+/// 只解析 `remember` 的成功文本。`is_error` 已在 [`tool_error_message`] 里变成 `Err`。
+///
+/// 旧服务若仍把 `denied by min_role` 当成功字符串返回，这里也拒绝，避免写成已落库。
+fn classify_remember_text(raw: &str) -> MemoryResult<String> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("remembered ") {
+        let id = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_string();
+        return Ok(id);
+    }
+    if raw.starts_with("denied by cross-border policy") {
+        return Err(format!("记忆写入被跨境策略拒绝: {}", raw));
+    }
+    if raw.starts_with("denied by min_role") {
+        return Err(raw.to_string());
+    }
+    Ok(raw.to_string())
+}
+
 /// 从 `CallToolResult` 里取出「工具真正返回的东西」。
 ///
 /// ## 为什么要这层（实测踩到的，不是预防性设计）
@@ -441,19 +487,8 @@ impl McpMemoryClient {
             Ok(Ok(r)) => r,
         };
 
-        if result.is_error == Some(true) {
-            let detail = result
-                .content
-                .iter()
-                .filter_map(|c| c.as_text())
-                .map(|t| t.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(format!(
-                "MCP 工具 `{}` 返回错误: {}",
-                tool,
-                if detail.is_empty() { "(无详情)" } else { &detail }
-            ));
+        if let Some(err) = tool_error_message(tool, &result) {
+            return Err(err);
         }
 
         Ok(extract_payload(&result).unwrap_or(serde_json::Value::Null))
@@ -472,12 +507,16 @@ impl McpMemoryClient {
         query: &str,
         kind: Option<&str>,
         k: usize,
+        actor_role: Option<&str>,
     ) -> MemoryResult<Vec<MemoryHit>> {
         let mut args = serde_json::Map::new();
         args.insert("query".into(), serde_json::Value::String(query.to_string()));
         args.insert("k".into(), serde_json::Value::from(k));
         if let Some(kind) = kind {
             args.insert("kind".into(), serde_json::Value::String(kind.to_string()));
+        }
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert("actor_role".into(), serde_json::Value::String(role.to_string()));
         }
 
         let value = self.call_tool("recall", args, self.recall_timeout).await?;
@@ -491,10 +530,12 @@ impl McpMemoryClient {
     ///
     /// ## 返回值语义（以真实 cortex-mcp 源码为准）
     ///
-    /// 对端的 `remember` 有三种文案：
+    /// 对端的 `remember` 成功文案：
     /// - `"remembered <id> (<kind>)"` ⇒ `Ok(<id>)`（已抽出裸 id，可直接喂 `forget`）；
     /// - `"denied by cross-border policy: <verdict> …"` ⇒ `Err(拒绝原因)`
     ///   —— **合规拒绝绝不能当成功**，否则调用方会以为记忆已落库；
+    /// - 角色不合法时对端抛错，`call_tool` 已因 `is_error` 返回 `Err`。
+    ///   若旧进程仍把 `denied by min_role` 当成功字符串返回，这里继续当成 `Err`；
     /// - 其它 ⇒ `Ok(原文)`（保守透传，不猜）。
     pub async fn remember(
         &self,
@@ -502,6 +543,7 @@ impl McpMemoryClient {
         kind: Option<&str>,
         metadata: Option<serde_json::Value>,
         importance: Option<f64>,
+        actor_role: Option<&str>,
     ) -> MemoryResult<String> {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -518,40 +560,40 @@ impl McpMemoryClient {
         if let Some(importance) = importance {
             args.insert("importance".into(), serde_json::Value::from(importance));
         }
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
 
         let value = self.call_tool("remember", args, self.write_timeout).await?;
         let raw = match value {
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         };
-        let raw = raw.trim();
-
-        if let Some(rest) = raw.strip_prefix("remembered ") {
-            // "remembered <id> (<kind>)" —— 第一个空白前就是裸 id
-            let id = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or(rest)
-                .trim()
-                .to_string();
-            return Ok(id);
-        }
-        if raw.starts_with("denied by cross-border policy") {
-            return Err(format!("记忆写入被跨境策略拒绝: {}", raw));
-        }
-        Ok(raw.to_string())
+        classify_remember_text(&raw)
     }
 
-    /// 按 id 删除一条记忆（cortex-mcp `forget`）。
+    /// 按 id 删除一条记忆（cortex-mcp `forget`）。最低 `steward`。
+    ///
+    /// `actor_role` 非空才传给对端。空则由对端读进程环境 `CORTEX_DEFAULT_ACTOR_ROLE`；
+    /// 该默认值若是 `participant`，删除会被拒绝。
     ///
     /// 对端在删不到时返回 `"<id> not found"`（**不是错误**），所以这里用
     /// `Ok(false)` 表达「没删到」，只有调用失败才 `Err`。
-    pub async fn forget(&self, memory_id: &str) -> MemoryResult<bool> {
+    pub async fn forget(&self, memory_id: &str, actor_role: Option<&str>) -> MemoryResult<bool> {
         let mut args = serde_json::Map::new();
         args.insert(
             "memory_id".into(),
             serde_json::Value::String(memory_id.to_string()),
         );
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
         let value = self.call_tool("forget", args, self.write_timeout).await?;
         Ok(match &value {
             serde_json::Value::String(s) => !s.contains("not found"),
@@ -559,13 +601,23 @@ impl McpMemoryClient {
         })
     }
 
-    /// 元认知巩固（cortex-mcp `consolidate_memories`）。
+    /// 元认知巩固（cortex-mcp `consolidate_memories`）。最低 `steward`。
     ///
     /// ⚠️ 工具名是 `consolidate_memories`，不是 `consolidate` —— 以真机
     /// cortex-mcp 的 `tools/list` 为准（T1.0 夹具当时写成 `consolidate`，
     /// 已同步修正，否则会 `tool not found`）。
-    pub async fn consolidate(&self) -> MemoryResult<serde_json::Value> {
-        self.call_tool("consolidate_memories", serde_json::Map::new(), self.write_timeout)
+    ///
+    /// `actor_role` 的传递规则与 [`Self::forget`] 相同。操作者进程的
+    /// `participant` 默认值不够，调用方要显式传 `steward`。
+    pub async fn consolidate(&self, actor_role: Option<&str>) -> MemoryResult<serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
+        self.call_tool("consolidate_memories", args, self.write_timeout)
             .await
     }
 }
@@ -625,5 +677,37 @@ mod tests {
     #[test]
     fn recall_payload_blank_string_is_err() {
         assert!(normalize_recall_payload(json!("")).is_err());
+    }
+
+    /// 角色拒绝必须是工具错误，不能进成功 payload。
+    #[test]
+    fn min_role_denial_is_tool_error() {
+        let result = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "denied by min_role: remember requires participant, got observer",
+        )]);
+        let err = tool_error_message("remember", &result).expect("is_error 必须变成错误");
+        assert!(err.contains("denied by min_role"), "{err}");
+        assert!(err.contains("remember"), "{err}");
+        assert!(tool_error_message(
+            "remember",
+            &rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "remembered m-1 (episodic)"
+            )])
+        )
+        .is_none());
+    }
+
+    /// 旧服务若仍返回拒绝文案且 is_error=false，也不能当成写入成功。
+    #[test]
+    fn leftover_min_role_string_is_not_a_write() {
+        let err = classify_remember_text(
+            "denied by min_role: remember requires participant, got observer",
+        )
+        .expect_err("拒绝文案不能是 Ok");
+        assert!(err.contains("denied by min_role"), "{err}");
+        assert_eq!(
+            classify_remember_text("remembered m-1 (episodic)").unwrap(),
+            "m-1"
+        );
     }
 }

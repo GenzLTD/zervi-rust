@@ -15,6 +15,20 @@ pub struct ResumeRecord {
     pub resume_id: String,
     pub text: String,
     pub created_at: String,
+    /// 终端身份：zervi-auth `sub` 原样（GFCC 1.3.0 `actor_sub`）。
+    /// `None` 只应出现在显式放行匿名的开发模式；终端的正常路径必有值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_sub: Option<String>,
+}
+
+/// job_match 回写到 identity 的辅助痕迹。人不能自封 evidence。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CapabilityTrace {
+    pub label: String,
+    pub source_port: String,
+    pub weight: String,
+    pub observed_at: String,
+    pub actor_sub: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +61,9 @@ pub struct ApplicationRecord {
     pub status: ApplicationStatus,
     pub updated_at: String,
     pub user_decision: Option<String>,
+    /// 归属身份，随简历继承。用于拒绝跨 actor 的收件箱读取与决策。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_sub: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
