@@ -19,6 +19,7 @@ name = "payment_service"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+jsonwebtoken.workspace = true
 
 # JWS 验签三件套（本阶段核心）
 base64 = "0.22"

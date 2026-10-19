@@ -2455,6 +2455,7 @@ name = "payment-service"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "jsonwebtoken",
  "ring",
  "serde",
  "serde_json",
