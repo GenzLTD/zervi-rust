@@ -2455,9 +2455,11 @@ name = "payment-service"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "common",
  "jsonwebtoken",
  "reqwest",
  "ring",
+ "sea-orm",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
