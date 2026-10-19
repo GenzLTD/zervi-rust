@@ -422,6 +422,7 @@ async fn main() -> ExitCode {
                 Some(args.kind.as_str()),
                 Some(serde_json::json!({"source": "mcp-memory-seed", "purpose": "ab-preload"})),
                 Some(args.importance),
+                Some("participant"),
             )
             .await
         {
@@ -470,7 +471,7 @@ async fn main() -> ExitCode {
     // `--require-topics`）确认进 prompt 的是不是同类岗位。这一步不能省，
     // 因为注入阶段 `memory_injected` 必定为 true，内容跑偏时 Δ 无法归因。
     if let Some(query) = &args.verify_query {
-        match client.recall(query, Some(args.kind.as_str()), 5).await {
+        match client.recall(query, Some(args.kind.as_str()), 5, Some("observer")).await {
             Ok(hits) => {
                 println!(
                     "验证 recall：hits={}（query 前 40 字：{}…）",

@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::models::{
-    ApplicationRecord, ApplicationStatus, ResumeRecord, SeedJob,
+    ApplicationRecord, ApplicationStatus, CapabilityTrace, MatchItem, ResumeRecord, SeedJob,
 };
 
 #[derive(Default)]
@@ -16,6 +16,7 @@ pub struct StoreData {
     pub jobs: Vec<SeedJob>,
     pub resumes: HashMap<String, ResumeRecord>,
     pub applications: HashMap<String, ApplicationRecord>,
+    pub traces: Vec<CapabilityTrace>,
 }
 
 #[derive(Clone)]
@@ -31,6 +32,7 @@ impl Store {
                 jobs,
                 resumes: HashMap::new(),
                 applications: HashMap::new(),
+                traces: Vec::new(),
             })),
         })
     }
@@ -54,6 +56,35 @@ impl Store {
 
     pub async fn jobs(&self) -> Vec<SeedJob> {
         self.inner.read().await.jobs.clone()
+    }
+
+    /// 系统写入。weight 固定 auxiliary，source_port 固定 job_match。
+    pub async fn append_job_match_traces(&self, actor_sub: &str, matches: &[MatchItem]) {
+        if actor_sub.is_empty() || matches.is_empty() {
+            return;
+        }
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let mut g = self.inner.write().await;
+        for item in matches {
+            g.traces.push(CapabilityTrace {
+                label: item.title.clone(),
+                source_port: "job_match".to_string(),
+                weight: "auxiliary".to_string(),
+                observed_at: observed_at.clone(),
+                actor_sub: actor_sub.to_string(),
+            });
+        }
+    }
+
+    pub async fn traces_for(&self, actor_sub: &str) -> Vec<CapabilityTrace> {
+        self.inner
+            .read()
+            .await
+            .traces
+            .iter()
+            .filter(|t| t.actor_sub == actor_sub)
+            .cloned()
+            .collect()
     }
 
     pub async fn create_applications(

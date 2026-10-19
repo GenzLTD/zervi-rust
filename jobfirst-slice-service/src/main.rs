@@ -83,6 +83,34 @@ fn actor_required(headers: &HeaderMap) -> Result<Option<String>, Response> {
 }
 
 /// 数据归属判定。未归因的数据（匿名开发模式写入）不拒绝；有主数据必须同 actor。
+const ROLE_LADDER: [&str; 8] = [
+    "observer",
+    "participant",
+    "experimenter",
+    "proposer",
+    "steward",
+    "organizer",
+    "actor",
+    "petitioner",
+];
+
+fn role_at_least(role: &str, minimum: &str) -> bool {
+    let rank = |name: &str| ROLE_LADDER.iter().position(|r| *r == name);
+    match (rank(role), rank(minimum)) {
+        (Some(have), Some(need)) => have >= need,
+        _ => false,
+    }
+}
+
+fn actor_role(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-actor-role")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+}
+
 fn owned_by(owner: &Option<String>, actor: &Option<String>) -> bool {
     match (owner, actor) {
         (Some(o), Some(a)) => o == a,
@@ -114,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/inbox", get(get_inbox))
         .route("/inbox/:application_id/decision", post(post_decision))
         .route("/dev/mock-feedback", post(post_mock_feedback))
+        .route("/capability-trace", get(get_capability_trace))
         .layer(cors)
         .with_state(state);
 
@@ -182,7 +211,31 @@ async fn get_matches(
     }
     let jobs = st.store.jobs().await;
     let matches = rank_jobs(&resume.text, &jobs, q.top);
+    if let Some(actor_sub) = actor.as_deref() {
+        st.store
+            .append_job_match_traces(actor_sub, &matches)
+            .await;
+    }
     ok(json!({ "resume_id": q.resume_id, "matches": matches })).into_response()
+}
+
+/// 只读本人的辅助痕迹。读记忆/身份的最低角色是 observer。
+async fn get_capability_trace(headers: HeaderMap, State(st): State<AppState>) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(Some(actor)) => actor,
+        Ok(None) => {
+            return err_with_status(StatusCode::UNAUTHORIZED, 401, "缺少终端身份（x-actor-sub）");
+        }
+        Err(resp) => return resp,
+    };
+    let Some(role) = actor_role(&headers) else {
+        return err_with_status(StatusCode::FORBIDDEN, 403, "缺少八角梯角色");
+    };
+    if !role_at_least(&role, "observer") {
+        return err_with_status(StatusCode::FORBIDDEN, 403, "capability_trace 读取需要 observer");
+    }
+    let traces = st.store.traces_for(&actor).await;
+    ok(json!({ "actor_sub": actor, "traces": traces })).into_response()
 }
 
 async fn post_apply(
@@ -299,5 +352,45 @@ async fn post_mock_feedback(
             ok(json!(app)).into_response()
         }
         Err(e) => err_with_status(StatusCode::NOT_FOUND, 404, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_at_least;
+    use crate::models::MatchItem;
+    use crate::store::Store;
+
+    #[test]
+    fn observer_can_read_but_cannot_pass_participant_gate() {
+        assert!(role_at_least("observer", "observer"));
+        assert!(!role_at_least("observer", "participant"));
+        assert!(role_at_least("participant", "observer"));
+        assert!(!role_at_least("candidate", "observer"));
+    }
+
+    /// job_match 只写 auxiliary，且只挂在当前 actor 上。空身份或空结果不落痕迹。
+    #[tokio::test]
+    async fn job_match_writes_auxiliary_trace_for_that_actor_only() {
+        let store = Store::new().await.expect("seed jobs");
+        let item = MatchItem {
+            job_id: "j1".into(),
+            title: "Rust 工程师".into(),
+            company_name: "acme".into(),
+            score: 1.0,
+            reason_preview: "kw".into(),
+        };
+        store.append_job_match_traces("", &[item.clone()]).await;
+        store.append_job_match_traces("actor-a", &[]).await;
+        assert!(store.traces_for("actor-a").await.is_empty());
+
+        store.append_job_match_traces("actor-a", &[item]).await;
+        let mine = store.traces_for("actor-a").await;
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].label, "Rust 工程师");
+        assert_eq!(mine[0].source_port, "job_match");
+        assert_eq!(mine[0].weight, "auxiliary");
+        assert_eq!(mine[0].actor_sub, "actor-a");
+        assert!(store.traces_for("actor-b").await.is_empty());
     }
 }

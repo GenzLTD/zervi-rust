@@ -147,6 +147,7 @@ async fn main() -> ExitCode {
                 "privacy_tier": "public",
             })),
             Some(0.5),
+            Some("participant"),
         )
         .await
     {
@@ -163,7 +164,7 @@ async fn main() -> ExitCode {
 
     // ② recall（带超时上限）
     let t = Instant::now();
-    match client.recall(&marker, Some("episodic"), 5).await {
+    match client.recall(&marker, Some("episodic"), 5, Some("observer")).await {
         Ok(hits) => {
             // 注意：真实 cortex-mcp 的 recall 会走向量检索，命中条数取决于 embedding，
             // 这里不把「必须命中」当断言，只断言调用在超时内返回。

@@ -66,6 +66,19 @@ const SUPABASE_AUDIENCE: &str = "authenticated";
 const X_USER_PREFIX: &str = "x-user-";
 /// memory.recall 的身份头。不是 `x-user-*`，前缀剥离覆盖不到，必须单独清掉再重写。
 const X_ACTOR_SUB: &str = "x-actor-sub";
+/// 八角梯角色。客户端自带的同名头同样可伪造，必须先剥再按 token 重写。
+const X_ACTOR_ROLE: &str = "x-actor-role";
+/// 与 `gfcc/contracts/roles.v1.json` 的 `role_enum` 同序。下标越大权限越高。
+const ROLE_LADDER: [&str; 8] = [
+    "observer",
+    "participant",
+    "experimenter",
+    "proposer",
+    "steward",
+    "organizer",
+    "actor",
+    "petitioner",
+];
 /// JWKS 缓存寿命，对齐 looma `PyJWKClient(lifespan=600)`。
 /// 缓存是硬要求：不得每请求拉网（ADR-0012 D1.1）。
 const JWKS_TTL: Duration = Duration::from_secs(600);
@@ -89,6 +102,15 @@ struct GatewayClaims {
     /// 可选：签发侧写入的订阅档位；缺省回落 `GATEWAY_DEFAULT_TIER`，再缺省 `free`
     #[serde(default)]
     tier: Option<String>,
+    /// zervi-auth 市场角色，取值是八角梯 id。不在梯上的值视为没有角色。
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// 只接受八角梯上的角色。大小写不敏感；`candidate` 一类市场外的字符串返回 None。
+fn canonical_ladder_role(raw: Option<&str>) -> Option<&'static str> {
+    let raw = raw?.trim().to_ascii_lowercase();
+    ROLE_LADDER.iter().copied().find(|role| *role == raw)
 }
 
 /// 解析档位：只认 free/basic/pro，其余一律按 free（拒绝放宽）。
@@ -424,13 +446,17 @@ pub(crate) async fn authenticate_and_stamp(
     for k in forged {
         headers.remove(k);
     }
-    // 客户端自带的原始 sub 一律丢掉，只放网关从 token 取出的那一份。
+    // 客户端自带的原始 sub / 角色一律丢掉，只放网关从 token 取出的那一份。
     headers.remove(X_ACTOR_SUB);
+    headers.remove(X_ACTOR_ROLE);
 
     if let Ok(v) = HeaderValue::from_str(&uid) {
         headers.insert("X-User-Id", v);
     }
     headers.insert(X_ACTOR_SUB, actor_header);
+    if let Some(role) = canonical_ladder_role(claims.role.as_deref()) {
+        headers.insert(X_ACTOR_ROLE, HeaderValue::from_static(role));
+    }
     // 无真实邮箱（小程序-only 用户）时**不注入**该头 —— 上面的剥离已保证它
     // 不会以客户端携带的值漏出，从而维持 D2 的 email_hash=None 语义
     if let Some(email) = claims
@@ -616,6 +642,7 @@ mod tests {
                 sub: SUB_A.to_string(),
                 email: None,
                 tier: Some(input.to_string()),
+                role: None,
             };
             assert_eq!(resolve_tier(&claims), want, "tier={:?}", input);
         }

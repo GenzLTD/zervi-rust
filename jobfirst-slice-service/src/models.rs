@@ -21,6 +21,16 @@ pub struct ResumeRecord {
     pub actor_sub: Option<String>,
 }
 
+/// job_match 回写到 identity 的辅助痕迹。人不能自封 evidence。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CapabilityTrace {
+    pub label: String,
+    pub source_port: String,
+    pub weight: String,
+    pub observed_at: String,
+    pub actor_sub: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchItem {
     pub job_id: String,

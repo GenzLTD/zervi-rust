@@ -116,7 +116,7 @@ pub async fn upload_single(
                 Some("A/B 对照组：X-Memory-Mode: off（仅测量面开启时生效）".to_string());
             tracing::info!("🧪 A/B 对照组：本请求跳过记忆（recall / remember 均不调）");
         } else {
-            match state.memory.recall(&recall_query, Some("episodic"), 5).await {
+            match state.memory.recall(&recall_query, Some("episodic"), 5, Some(claims.role.as_str())).await {
                 Ok(hits) => {
                     tracing::info!("🧠 记忆命中 {} 条（query={}）", hits.len(), recall_query);
                     if state.config.memory_prompt_injection {
@@ -222,7 +222,7 @@ pub async fn upload_single(
 
             match state
                 .memory
-                .remember(&content, Some("episodic"), Some(metadata), Some(0.6))
+                .remember(&content, Some("episodic"), Some(metadata), Some(0.6), Some(claims.role.as_str()))
                 .await
             {
                 Ok(id) => tracing::info!("🧠 记忆已写入: {}", id),

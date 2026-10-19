@@ -472,12 +472,16 @@ impl McpMemoryClient {
         query: &str,
         kind: Option<&str>,
         k: usize,
+        actor_role: Option<&str>,
     ) -> MemoryResult<Vec<MemoryHit>> {
         let mut args = serde_json::Map::new();
         args.insert("query".into(), serde_json::Value::String(query.to_string()));
         args.insert("k".into(), serde_json::Value::from(k));
         if let Some(kind) = kind {
             args.insert("kind".into(), serde_json::Value::String(kind.to_string()));
+        }
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert("actor_role".into(), serde_json::Value::String(role.to_string()));
         }
 
         let value = self.call_tool("recall", args, self.recall_timeout).await?;
@@ -502,6 +506,7 @@ impl McpMemoryClient {
         kind: Option<&str>,
         metadata: Option<serde_json::Value>,
         importance: Option<f64>,
+        actor_role: Option<&str>,
     ) -> MemoryResult<String> {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -517,6 +522,12 @@ impl McpMemoryClient {
         }
         if let Some(importance) = importance {
             args.insert("importance".into(), serde_json::Value::from(importance));
+        }
+        if let Some(role) = actor_role.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "actor_role".into(),
+                serde_json::Value::String(role.to_string()),
+            );
         }
 
         let value = self.call_tool("remember", args, self.write_timeout).await?;
@@ -538,6 +549,9 @@ impl McpMemoryClient {
         }
         if raw.starts_with("denied by cross-border policy") {
             return Err(format!("记忆写入被跨境策略拒绝: {}", raw));
+        }
+        if raw.starts_with("denied by min_role") {
+            return Err(raw.to_string());
         }
         Ok(raw.to_string())
     }
