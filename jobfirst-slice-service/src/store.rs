@@ -35,12 +35,13 @@ impl Store {
         })
     }
 
-    pub async fn add_resume(&self, text: String) -> ResumeRecord {
+    pub async fn add_resume(&self, text: String, actor_sub: Option<String>) -> ResumeRecord {
         let id = format!("resume-{}", Uuid::new_v4());
         let record = ResumeRecord {
             resume_id: id.clone(),
             text,
             created_at: chrono::Utc::now().to_rfc3339(),
+            actor_sub,
         };
         let mut g = self.inner.write().await;
         g.resumes.insert(id.clone(), record.clone());
@@ -59,6 +60,7 @@ impl Store {
         &self,
         resume_id: &str,
         job_ids: &[String],
+        actor_sub: Option<String>,
     ) -> Result<Vec<ApplicationRecord>> {
         let mut g = self.inner.write().await;
         let mut out = Vec::new();
@@ -79,11 +81,21 @@ impl Store {
                 status: ApplicationStatus::Submitted,
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 user_decision: None,
+                actor_sub: actor_sub.clone(),
             };
             g.applications.insert(app_id, record.clone());
             out.push(record);
         }
         Ok(out)
+    }
+
+    pub async fn get_application(&self, application_id: &str) -> Option<ApplicationRecord> {
+        self.inner
+            .read()
+            .await
+            .applications
+            .get(application_id)
+            .cloned()
     }
 
     pub async fn inbox_for_resume(&self, resume_id: &str) -> Vec<ApplicationRecord> {

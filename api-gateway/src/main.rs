@@ -159,11 +159,29 @@ async fn route_to_application_service(
     route_to_service(&state, "application-service", 3005, &path, req).await
 }
 
+/// `/api/v1/slice/*` —— 终端侧的 job_match 适配器入口。
+///
+/// 与 `/v1/ask` 共用 `authenticate_and_stamp`：先验 token，再注入
+/// `X-Actor-Sub`（原始 sub）与 `X-User-Id`（sha256(sub)）。此前这条路由是
+/// **纯透传**：匿名也能写简历、读收件箱，且下游拿不到任何身份 ——
+/// GFCC 1.3.0 要求 `job_match` 结果只能以 `weight: auxiliary` 喂
+/// `identity.capability_trace`，没有 actor 就无法归因，适配器等于不可用。
 async fn route_to_jobfirst_slice(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    req: Request,
+    uri: Uri,
+    mut req: Request,
 ) -> Response {
+    if let Err(resp) = tatha::authenticate_and_stamp(&mut req).await {
+        tracing::warn!("🚫 /api/v1/slice/{} rejected: no identity", path);
+        return resp;
+    }
+    // `Path` 只给出路径段，query 会被丢掉；`matches` / `inbox` 都靠 query 传
+    // `resume_id`，不补回去下游就会报「missing field resume_id」。
+    let path = match uri.query() {
+        Some(q) => format!("{}?{}", path, q),
+        None => path,
+    };
     route_to_service(&state, "jobfirst-slice-service", 3005, &path, req).await
 }
 

@@ -6,6 +6,8 @@ use match_algo::rank_jobs;
 
 use axum::{
     extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -46,6 +48,47 @@ fn err(code: i32, msg: impl Into<String>) -> Json<Envelope<Value>> {
         msg: msg.into(),
         data: None,
     })
+}
+
+fn err_with_status(status: StatusCode, code: i32, msg: impl Into<String>) -> Response {
+    (status, err(code, msg)).into_response()
+}
+
+/// 终端身份：网关注入的原始 `sub`（GFCC 1.3.0 `actor_sub`）。
+fn actor_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-actor-sub")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// 默认 fail-closed：缺身份即 401。
+///
+/// `JOBFIRST_SLICE_ALLOW_ANONYMOUS=1` 只留给本机旧脚本/单点联调，终端部署不设。
+fn actor_required(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let actor = actor_of(headers);
+    let allow_anonymous = std::env::var("JOBFIRST_SLICE_ALLOW_ANONYMOUS")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if actor.is_none() && !allow_anonymous {
+        return Err(err_with_status(
+            StatusCode::UNAUTHORIZED,
+            401,
+            "缺少终端身份（x-actor-sub）",
+        ));
+    }
+    Ok(actor)
+}
+
+/// 数据归属判定。未归因的数据（匿名开发模式写入）不拒绝；有主数据必须同 actor。
+fn owned_by(owner: &Option<String>, actor: &Option<String>) -> bool {
+    match (owner, actor) {
+        (Some(o), Some(a)) => o == a,
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
 }
 
 #[tokio::main]
@@ -91,14 +134,23 @@ async fn health() -> &'static str {
 }
 
 async fn post_resume(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Json(body): Json<PostResumeBody>,
-) -> Json<Envelope<Value>> {
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if body.text.trim().is_empty() {
-        return err(400, "text 不能为空");
+        return err(400, "text 不能为空").into_response();
     }
-    let record = st.store.add_resume(body.text).await;
-    ok(json!({ "resume_id": record.resume_id }))
+    let record = st.store.add_resume(body.text, actor).await;
+    ok(json!({
+        "resume_id": record.resume_id,
+        "actor_sub": record.actor_sub,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -113,34 +165,51 @@ fn default_top() -> usize {
 }
 
 async fn get_matches(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Query(q): Query<MatchesQuery>,
-) -> Json<Envelope<Value>> {
-    let Some(resume) = st.store.get_resume(&q.resume_id).await else {
-        return err(404, "resume_id 不存在");
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
     };
+    let Some(resume) = st.store.get_resume(&q.resume_id).await else {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
+    };
+    // 不区分「不存在」与「不是你的」：避免用 404/403 差异探测他人 resume_id。
+    if !owned_by(&resume.actor_sub, &actor) {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
+    }
     let jobs = st.store.jobs().await;
     let matches = rank_jobs(&resume.text, &jobs, q.top);
-    ok(json!({ "resume_id": q.resume_id, "matches": matches }))
+    ok(json!({ "resume_id": q.resume_id, "matches": matches })).into_response()
 }
 
 async fn post_apply(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Json(body): Json<PostApplyBody>,
-) -> Json<Envelope<Value>> {
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if body.job_ids.is_empty() {
-        return err(400, "job_ids 不能为空");
+        return err(400, "job_ids 不能为空").into_response();
     }
-    if st.store.get_resume(&body.resume_id).await.is_none() {
-        return err(404, "resume_id 不存在");
+    let Some(resume) = st.store.get_resume(&body.resume_id).await else {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
+    };
+    if !owned_by(&resume.actor_sub, &actor) {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
     }
     match st
         .store
-        .create_applications(&body.resume_id, &body.job_ids)
+        .create_applications(&body.resume_id, &body.job_ids, resume.actor_sub)
         .await
     {
-        Ok(apps) => ok(json!({ "applications": apps })),
-        Err(e) => err(400, e.to_string()),
+        Ok(apps) => ok(json!({ "applications": apps })).into_response(),
+        Err(e) => err(400, e.to_string()).into_response(),
     }
 }
 
@@ -150,34 +219,67 @@ struct InboxQuery {
 }
 
 async fn get_inbox(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Query(q): Query<InboxQuery>,
-) -> Json<Envelope<Value>> {
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(resume) = st.store.get_resume(&q.resume_id).await else {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
+    };
+    if !owned_by(&resume.actor_sub, &actor) {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "resume_id 不存在");
+    }
     let items = st.store.inbox_for_resume(&q.resume_id).await;
-    ok(json!({ "resume_id": q.resume_id, "items": items }))
+    ok(json!({ "resume_id": q.resume_id, "items": items })).into_response()
 }
 
 async fn post_decision(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Path(application_id): Path<String>,
     Json(body): Json<DecisionBody>,
-) -> Json<Envelope<Value>> {
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(app) = st.store.get_application(&application_id).await else {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "unknown application_id");
+    };
+    if !owned_by(&app.actor_sub, &actor) {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "unknown application_id");
+    }
     match st.store.set_decision(&application_id, &body.action).await {
-        Ok(app) => ok(json!(app)),
-        Err(e) => err(400, e.to_string()),
+        Ok(app) => ok(json!(app)).into_response(),
+        Err(e) => err(400, e.to_string()).into_response(),
     }
 }
 
 async fn post_mock_feedback(
+    headers: HeaderMap,
     State(st): State<AppState>,
     Json(body): Json<MockFeedbackBody>,
-) -> Json<Envelope<Value>> {
+) -> Response {
+    let actor = match actor_required(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let status = match body.status.as_str() {
         "replied" => ApplicationStatus::Replied,
         "invited" => ApplicationStatus::Invited,
         "rejected" => ApplicationStatus::Rejected,
-        _ => return err(400, "status 须为 replied | invited | rejected"),
+        _ => return err(400, "status 须为 replied | invited | rejected").into_response(),
     };
+    let Some(app) = st.store.get_application(&body.application_id).await else {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "unknown application_id");
+    };
+    if !owned_by(&app.actor_sub, &actor) {
+        return err_with_status(StatusCode::NOT_FOUND, 404, "unknown application_id");
+    }
     match st.store.set_feedback(&body.application_id, status.clone()).await {
         Ok(app) => {
             let event = match status {
@@ -191,10 +293,11 @@ async fn post_mock_feedback(
                 application_id = %app.application_id,
                 company = %app.company_name,
                 title = %app.title,
+                actor_sub = app.actor_sub.as_deref().unwrap_or("-"),
                 "feedback recorded (M0 log only)"
             );
-            ok(json!(app))
+            ok(json!(app)).into_response()
         }
-        Err(e) => err(404, e.to_string()),
+        Err(e) => err_with_status(StatusCode::NOT_FOUND, 404, e.to_string()),
     }
 }
