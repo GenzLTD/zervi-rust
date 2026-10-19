@@ -1,0 +1,36 @@
+[package]
+name = "payment-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# 骨架阶段（v0.1）：仅 JWS 验签层，不接数据库与 axum —— 保证本 crate
+# 可独立 `cargo check` / `cargo test`，不拖动 workspace 其他重依赖。
+# 后续版本按下表逐层解开：
+#   v0.2 `jwt`     — 解开 jsonwebtoken（ES256 请求令牌，App Store Server API）
+#   v0.3 `client`  — 解开 reqwest（API 封装，Sandbox/Prod 双 host）
+#   v0.4 `routes`  — 解开 axum + common(shared) + sea-orm（webhook/verify/restore）
+
+[lib]
+name = "payment_service"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# JWS 验签三件套（本阶段核心）
+base64 = "0.22"
+x509-parser = { version = "0.16", features = ["verify"] }
+ring = "0.17"
+
+# --- 后续启用（按上述版本计划） ---
+# chrono.workspace = true
+# jsonwebtoken.workspace = true
+# reqwest.workspace = true
+# uuid.workspace = true
+# axum.workspace = true
+# tokio.workspace = true
+# common = { package = "common", path = "../shared/common" }
+# sea-orm.workspace = true

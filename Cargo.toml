@@ -14,6 +14,7 @@ members = [
     "shared/consul-client",
     "shared/service-auth",  # 服务间认证库
     "shared/mcp-client",    # 终端侧 MCP 客户端（托管 cortex-mcp 记忆层，stdio 子进程）
+    "payment-service",      # Apple IAP（自研 Server Notification V2，2026-10-19 启动）
 ]
 resolver = "2"
 
