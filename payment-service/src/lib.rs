@@ -15,3 +15,4 @@
 pub mod client;
 pub mod jws;
 pub mod jwt;
+pub mod state_machine;
