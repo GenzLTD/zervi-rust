@@ -128,19 +128,37 @@ export SUPABASE_ACCESS_TOKEN="eyJ..."      # 或方案 2 的四个变量
 bash tools/e2e-supabase/lane-b.sh
 ```
 
-预期输出 `cases 13`、`verdict_sha256 <hash>`、`FAIL=0`。
+预期输出 `cases 13`、`PASS=13`、`FAIL=0`。
+
+判定项集合固定为 13 个，与后端是 mock 还是真 Supabase 无关。mock 自测基准值：
+
+```
+verdict_sha256 429a351a19d9af4ff4ad6ad58390746bbd5241d04090260ccff465125d715579
+```
+
+真 Supabase 应得到**同一个值**；不同即说明某项 PASS/FAIL 发生了变化，可据 `-gateway.log` 定位。
+（`lane-b.sh` 产出两个日志：`lane-b-<时间>.log` 是判定结果，`lane-b-<时间>-gateway.log` 是网关输出。）
 
 `lane-b.sh` 会自己拉起 `echo_server.py`（假上游，模拟 Tatha）和
 `target/debug/api-gateway`，跑完清理进程。它**不会**连你的数据库，只走
 `/auth/v1/.well-known/jwks.json`、`/auth/v1/token` 和网关的
 `/v1/auth/verify`、`/v1/ask`。
 
-如果不想碰真 Supabase，可以先用 `mock_supabase.py` 自建 JWKS + 密码换 token：
+如果不想碰真 Supabase，可以先用 `mock_supabase.py` 自建 JWKS + 密码换 token。
+**凭据到位前建议先跑一遍这个**，把"逻辑问题"和"凭据问题"分开：
 
 ```bash
-python mock_supabase.py &                  # 打印它监听的 URL
-SUPABASE_URL=http://127.0.0.1:54321 bash tools/e2e-supabase/lane-b.sh
+python -m pip install cryptography          # 一次性，只有 mock 需要
+python tools/e2e-supabase/mock_supabase.py &   # 默认 127.0.0.1:54321
+
+# 另外需要一个已构建的网关二进制：cargo build -p api-gateway
+SUPABASE_URL=http://127.0.0.1:54321 \
+SUPABASE_ANON_KEY=mock TEST_EMAIL=mock@example.com TEST_PASSWORD=x \
+bash tools/e2e-supabase/lane-b.sh
 ```
+
+上面三个 `SUPABASE_ANON_KEY` / `TEST_EMAIL` / `TEST_PASSWORD` 是假值，mock 不校验；
+但 `lane-b.sh` 要求它们非空，不设会直接报错。
 
 mock 只能证"逻辑通"，不能证"真 Supabase 的 JWKS 形状/签名算法可用"，两者结论不可互相替代。
 

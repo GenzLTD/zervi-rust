@@ -18,7 +18,12 @@ ensure_mingw_toolchain || exit 2
 
 OUT="$HERE/out"
 mkdir -p "$OUT"
-LOG="$OUT/lane-b-$(date +%Y%m%d-%H%M%S).log"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="$OUT/lane-b-$STAMP.log"
+# 网关/echo 的 stdout 必须单独落文件：Windows 上多进程同时 O_APPEND 同一文件
+# 并不可靠，会覆盖掉 shell 写的 PASS 行（实测 13 条只剩 8 条），
+# 进而让 verdict_sha256 这个对拍锚点失真。
+GWLOG="$OUT/lane-b-$STAMP-gateway.log"
 PASS=0
 FAIL=0
 GW_PID=""
@@ -32,7 +37,13 @@ case "$(uname -s)" in
 esac
 BIN="$REPO/target/debug/api-gateway$EXE"
 
-say() { echo "$*" | tee -a "$LOG"; }
+# 注意：不要用 tee 写日志。MSYS/部分环境下 tee 走管道时是块缓冲，
+# 进程内随后 grep 同一文件会读到不完整内容（实测 13 条只落了 8 条），
+# 导致 verdict_sha256 失真。这里用内建 printf 直接双写，无缓冲。
+say() {
+  printf '%s\n' "$*"
+  printf '%s\n' "$*" >> "$LOG"
+}
 ok() { PASS=$((PASS + 1)); say "PASS  $1"; }
 bad() { FAIL=$((FAIL + 1)); say "FAIL  $1 :: $2"; }
 cleanup() {
@@ -50,7 +61,7 @@ say "=== 环境 ==="
 say "base_commit $BASE_COMMIT"
 say "head_commit $(git -C "$REPO" rev-parse HEAD)"
 say "code_tree   $(git -C "$REPO" rev-parse "${BASE_COMMIT}^{tree}")"
-say "binary      $(ls -l --time-style=long-iso "$BIN" 2>/dev/null | awk '{print $6, $7}')"
+say "binary      $(ls -lh "$BIN" 2>/dev/null | awk '{print $5, $6, $7, $8}')"
 say "jwks        $JWKS_URL"
 
 assert_commit || exit 2
@@ -104,11 +115,11 @@ say "sub=$SUB"
 say "sha256(sub)=$EXPECT_UID"
 
 # ---------- 4) 起 echo 上游 + 网关 ----------
-"$PY" "$HERE/echo_server.py" >>"$LOG" 2>&1 &
+"$PY" "$HERE/echo_server.py" >>"$GWLOG" 2>&1 &
 ECHO_PID=$!
 GATEWAY_JWKS_URL="$JWKS_URL" GATEWAY_JWT_SECRET="gateway-secret-not-used-for-es256" \
   TATHA_BASE_URL="http://127.0.0.1:$TATHA_PORT" RUST_LOG=warn \
-  "$BIN" >>"$LOG" 2>&1 &
+  "$BIN" >>"$GWLOG" 2>&1 &
 GW_PID=$!
 
 for _ in $(seq 1 40); do
@@ -117,8 +128,8 @@ for _ in $(seq 1 40); do
 done
 curl -s -m 2 -o /dev/null "http://127.0.0.1:$GW_PORT/health" || {
   bad "gateway_up" ":$GW_PORT 未监听"
-  say "--- log ---"
-  tail -20 "$LOG"
+  say "--- gateway log ---"
+  tail -20 "$GWLOG"
   exit 1
 }
 ok "gateway_up"
@@ -172,4 +183,5 @@ say "=== 汇总 PASS=$PASS FAIL=$FAIL ==="
 say "cases       $VCOUNT"
 say "verdict_sha256 $VSHA"
 say "日志 $LOG"
+say "网关日志 $GWLOG"
 [ "$FAIL" -eq 0 ] || exit 1

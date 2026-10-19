@@ -1,9 +1,11 @@
 """本地 mock Supabase Auth：只做两件事 —— 发 JWKS、用密码换一枚 ES256 token。
 
 用途：在拿到真项目凭据之前，自测 lane-b.sh 的判定逻辑（不联网、不涉密）。
-需要 cryptography（用 C:/Users/dell/.workbuddy/binaries/python/envs/cortex/Scripts/python.exe）。
 
-用法：python mock_supabase.py [port]
+依赖：cryptography（只这个 mock 需要，lane-b 本身不需要）
+    python -m pip install cryptography
+
+用法：python mock_supabase.py [port]      # 默认 54321
 """
 import base64
 import json
