@@ -12,5 +12,6 @@
 //!     ⇒ REFUND/REVOKE 降级只需 UPDATE users，下一请求实时生效。
 //!   · 幂等以 apple_iap_transactions 的唯一约束兜底，webhook 必须无条件 200。
 
+pub mod client;
 pub mod jws;
 pub mod jwt;

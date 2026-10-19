@@ -2456,6 +2456,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",
