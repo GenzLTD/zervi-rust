@@ -15,6 +15,7 @@
 | 3 | P1-1 | `set_user_tier` 校验 `rows_affected == 1`；0 行 ⇒ `tracing::error!` + `DbErr::RecordNotUpdated`（→ 500） | `payment-service/src/routes.rs` |
 | 4 | P0-1 | `supabase_uid` 回填脚本（dry-run / apply / verify 三段，含审计表） | `shared/backfill_supabase_uid_v0.1.sql` |
 | 5 | — | 回填自包含验证（21 条断言，空库可跑） | `shared/verify_identity_link.sql` |
+| 6 | **新 P0** | `users` 三列类型对齐脚本（否则命中任意一行就 500，见第六节） | `shared/align_users_types_v0.1.sql` |
 
 ### 1.1 为什么是"NoAutoCreate"而不是"全禁"
 
@@ -151,7 +152,6 @@ psql -d zervi_verify_identity -v ON_ERROR_STOP=1 -f shared/verify_identity_link.
 dry-run 不写库、写入后 `updated_at`（text 列）不坏、被拦行不动、重入 0 写入、日志不翻倍。
 
 ### 4.3 生产形状副本演练
-
 `genzltd_20261020` dump 还原库（10 users / 0 绑定 / `updated_at` 为 text）：
 
 | 步骤 | 结果 |
@@ -162,6 +162,18 @@ dry-run 不写库、写入后 `updated_at`（text 列）不坏、被拦行不动
 | 回填后 | `10/10` 已绑 |
 | `identity_backfill_verify()` | unbound PASS / duplicate PASS / no_email PASS |
 | 再跑一次 apply | `0` 行写入（幂等） |
+
+### 4.4 409 端到端（真起服务、真打接口）
+
+`DATABASE_URL` 指向副本库、`SUPABASE_JWT_SECRET=local-test-secret` 自签 HS256 token：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 无 `Authorization` | 401 | `401 unauthorized` |
+| token 的 sub/email 都命中不到 | 409 | `409 {"error":"need_link","reason":"unlinked_login"}` |
+| 同上，事后查库 | 不建行 | `users` 仍 43 / 10 行，`bound` 不变 |
+| token 的 email 命中历史行 | 身份解析成功 | `503 apple_not_configured`（止于 Apple 配置）+ 该行自动绑定 |
+
 
 ---
 
@@ -175,3 +187,63 @@ dry-run 不写库、写入后 `updated_at`（text 列）不坏、被拦行不动
 3. **verify 的事务化**：现在 `upsert_subscription` 成功、`set_user_tier` 失败时订阅行已落库（tier 未生效）。
    重试可自愈，但严格做法是包一个事务。
 4. **`get_profile` 按 sub 重建档案**（P2-2 账号删除）：删号后仍会被重建，与 P0-1 同源，需一起改。
+
+---
+
+## 六、做这三件时撞出来的新 P0：entity ↔ 生产库类型不一致
+
+这个问题**比 P0-1 更早爆**，而且已被实测复现，所以一并给出修法与脚本（脚本已测，未对生产执行）。
+
+### 6.1 现象
+
+拿 `genzltd_20261020` dump 还原一份"生产形状"副本，起 payment-service，正常发一个
+`POST /v1/payment/apple/verify`（token 的 email 命中一行老账号）：
+
+```
+HTTP 500
+{"error":"server_error","message":"Query Error: error occurred while decoding column
+ \"is_early_adopter\": mismatched types; Rust type `core::option::Option<i32>`
+ (as SQL type `INT4`) is not compatible with SQL type `INT8`"}
+```
+
+**只要命中任意一行 `users` 就 500** —— 也就是说，真上了生产，"买完不解锁"会先以 500 的形式出现。
+
+### 6.2 原因
+
+| 列 | entity（按 v0.3 反生成） | 生产库实际 | 结果 |
+|---|---|---|---|
+| `is_early_adopter` | `Option<i32>` → INT4 | `bigint` → INT8 | 解码失败 |
+| `created_at` | `Option<DateTimeWithTimeZone>` → TIMESTAMPTZ | `text DEFAULT now()` | 解码失败 |
+| `updated_at` | 同上 | `text DEFAULT now()` | 解码失败 |
+
+`genzltd_schema_v0.3.sql` 是"参考快照"，Rust entity 是照它反生成的；生产库从没按它迁移过。
+（P0-1 的 409 之所以能跑通，是因为它走 0 行路径，不做解码 —— 这也说明这类问题**只会在有数据的路径上爆**。）
+
+### 6.3 修法（`shared/align_users_types_v0.1.sql`，已实测）
+
+```bash
+psql -d "$PROD" -v ON_ERROR_STOP=1 -f shared/align_users_types_v0.1.sql
+psql -d "$PROD" -c "select * from align_users_types_preview()"          # ① 体检
+psql -d "$PROD" -c "BEGIN; select * from align_users_types(true); COMMIT;"   # ② 执行
+# ③ 重启服务（sqlx 的 prepared statement 缓存旧结果类型，不重启会报
+#    cached plan must not change result type）
+```
+
+设计要点：先逐值试转（`identity_try_timestamptz`），有转不了的值就整列不动；
+`is_early_adopter` 超 int4 范围就拒绝；已是目标类型则跳过（可重入）；必须显式事务包住。
+
+### 6.4 修前 / 修后（同一库、同一请求）
+
+| 时刻 | 请求 | 结果 |
+|---|---|---|
+| 修前 | email 命中老账号 | `500` decode 错误 |
+| 修后 | 同上 | `503 apple_not_configured`（身份已解析，卡在 Apple 配置，符合预期） |
+| 修后 | 未绑定 token | `409 need_link` |
+| 修后 | users 行数 | `10`（没有新增行） |
+
+### 6.5 待办
+
+**相同类型的失真不只 users 一列**：v0.3 里有 82 处时间列在生产库是 `text`。
+其余 51 张表的 entity 是否也解不出来，需要一次系统比对（entity 声明类型 × 生产 `information_schema`），
+这属于 schema 迁移的一部分，建议排在 Bundle ID 定版之后、真机联调之前。
+
