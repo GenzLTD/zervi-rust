@@ -34,14 +34,10 @@ impl UserService {
         }
 
         // 未知 role（含 observer）在插入前拒绝，不落成 candidate，两个库行数都不变。
-        let role_enum = match role.as_str() {
-            "candidate" => UserRole::Candidate,
-            "recruiter" => UserRole::Recruiter,
-            "admin" => UserRole::Admin,
-            other => {
-                return Err(AppError::BadRequest(format!("不支持的 role: {}", other)));
-            }
-        };
+        // 归一放在 UserRole::from_any：平台词汇 user/enterprise/driver 也认，
+        // 但未知值一律返回 None → 400，不兜底。
+        let role_enum = UserRole::from_any(&role)
+            .ok_or_else(|| AppError::BadRequest(format!("不支持的 role: {}", role)))?;
 
         // 另一个 sub 带上已存在的 phone：返回 409，不插入（不再折成 500）。
         if User::find()
