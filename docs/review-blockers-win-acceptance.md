@@ -1,7 +1,24 @@
-# fix/review-blockers 验收单（Win 侧）
+# 评审阻断项修复 验收单（Win 侧）
 
-分支：`fix/review-blockers` = `d16ff22`（基于 `feat/apple-iap` / `2b107cd`）
-两个提交：`a522915`（role 归一 + 账号删除能力）、`d16ff22`（预检脚本 + role 分布证据）
+## 分支拓扑（先看这个，不要按天字面核对 SHA）
+
+同一份改动存在于两个分支上，**代码内容逐字节相同**，差别只在历史基座：
+
+| 分支 | 基座 | 用途 |
+|---|---|---|
+| `fix/review-blockers` | `feat/apple-iap`（`2b107cd`） | 首轮验收用，Win 侧已按此验过 A 组 |
+| `fix/role-account-on-main` | `main`（`f00e737`） | **可合并分支**，只含 3 个提交，不带 gap-close / Apple IAP |
+
+对应提交：
+
+| 内容 | apple-iap 版 | main 版 |
+|---|---|---|
+| role 归一 + 账号删除 | `a522915` | `386e412` |
+| 预检脚本 + role 证据 | `d16ff22` | `6100307` |
+| 本验收单 | `876e4da` | `b5750ac` |
+
+**所以验收时不要盯 SHA**——`git rev-parse HEAD` 在两个分支上必然不同，这不是缺陷。
+用下面的"结果断言"代替：改动文件数 = 7、`cargo test` = 6 passed。
 
 ## 安全边界（先看这条）
 
@@ -20,10 +37,17 @@
 
 ```powershell
 git fetch origin
-git checkout fix/review-blockers
-git rev-parse HEAD          # 期望 d16ff226c0b8bdf281e830334bd04b55c0ec24a6
-cargo test -p user-service
+git checkout fix/role-account-on-main     # 可合并版；要复现首轮验收则用 fix/review-blockers
+git log --oneline -3
+git diff --stat origin/main..HEAD          # 期望：7 files changed
+cargo test -p user-service                 # 期望：6 passed
 ```
+
+**结果断言**（三条全中即通过，不必对 SHA）：
+
+1. `git log --oneline -3` 显示 3 个提交，基座是 `f00e737`
+2. `git diff --stat origin/main..HEAD` = **7 files changed**，且**不含** `payment-service/` 或 `genzltd_schema_v0.3`
+3. `cargo test -p user-service` = `6 passed; 0 failed`
 
 **期望**：`test result: ok. 6 passed; 0 failed`
 
@@ -37,7 +61,31 @@ git checkout fix/review-blockers                          # 期望：6 passed
 
 ---
 
-## B. 预检脚本（只读，可在生产库跑）
+## B0. 没有生产库连接时怎么验（Win 侧当前就是这种情形）
+
+不需要 `GENZLTD_DATABASE_URL`、也不需要 dump，任意空库即可：
+
+```bash
+createdb zervi_verify
+psql -d zervi_verify -v ON_ERROR_STOP=1 -f shared/account_delete_v0.1.sql
+psql -d zervi_verify -v ON_ERROR_STOP=1 -f shared/verify_account_delete.sql
+dropdb zervi_verify
+```
+
+**期望末行**：`NOTICE: ===== ALL CHECKS PASSED =====`
+
+脚本会按 policy 自动建 41 张最小表、给每张表挂 1 行（poems 挂 3 行），
+再跑完整 purge 并断言四件事：users 行已删 / D 档 0 残留 /
+poems 3 行完好且 `publisher_id` 置空 / iap 留痕保留。
+
+macOS 侧实测输出：42 条删除记录（41 张表 + users），断言全过。
+
+> 这验证的是**函数逻辑**（表名拼写、收敛、N 档语义、audit 完整性），
+> 不是"生产库是否真的长这样"。后者只能在有连接时用下面的 B 组。
+
+---
+
+## B. 预检脚本（有生产连接时；只读，可在生产库跑）
 
 ```powershell
 psql $env:GENZLTD_DATABASE_URL -f shared/preflight_review_blockers.sql
@@ -56,7 +104,7 @@ psql $env:GENZLTD_DATABASE_URL -f shared/preflight_review_blockers.sql
 
 ---
 
-## C. 删号能力（事务内，必须回滚）
+## C. 删号能力（有生产连接时；事务内，必须回滚）
 
 ### C1 装载函数（幂等，可重复执行）
 

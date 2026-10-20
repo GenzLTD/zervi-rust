@@ -116,11 +116,15 @@ BEGIN
     END LOOP;
 
     -- 交易留痕表（无 FK，不阻塞删号，但含个人标识，需单独脱敏）
-    EXECUTE 'SELECT count(*) FROM public.iap_subscriptions WHERE user_id = $1'
-        INTO n USING p_uid;
-    IF n > 0 THEN
-        tbl := 'iap_subscriptions'; col := 'user_id'; act := 'ANON'; rows_affected := n;
-        RETURN NEXT;
+    -- 用 to_regclass 判存在：该表由 payment-service/schema_v0.1.sql 单独创建，
+    -- 没跑过那份 DDL 的环境里不该让 preview 直接炸。
+    IF to_regclass('public.iap_subscriptions') IS NOT NULL THEN
+        EXECUTE 'SELECT count(*) FROM public.iap_subscriptions WHERE user_id = $1'
+            INTO n USING p_uid;
+        IF n > 0 THEN
+            tbl := 'iap_subscriptions'; col := 'user_id'; act := 'ANON'; rows_affected := n;
+            RETURN NEXT;
+        END IF;
     END IF;
 END
 $fn$;
@@ -205,7 +209,10 @@ AS $fn$
                (c.confdeltype <> 'a') AS auto   -- CASCADE / SET NULL 由外键自动处理
         FROM pg_constraint c
         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
-        WHERE c.contype = 'f' AND c.confrelid = 'public.users'::regclass
+        WHERE c.contype = 'f'
+          -- 用 to_regclass 而非 'public.users'::regclass：
+          -- 后者在建表前会直接抛 "relation does not exist"，导致函数无法先于表装载。
+          AND c.confrelid = to_regclass('public.users')
     ),
     anon AS (
         -- 无外键、含个人标识，但按合规需保留交易留痕的表（只脱敏不删）
