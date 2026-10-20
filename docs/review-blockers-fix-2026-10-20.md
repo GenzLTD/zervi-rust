@@ -69,6 +69,20 @@ FK 挡不住、也不会报错，删号后会静默残留。已加入 policy，�
 
 保持不变：`0c40b6f` 的既定语义"未知 role 不落 candidate"。
 
+**这不是预防性修复，缺陷已经存在于现存数据里**。生产库实测：
+
+```
+role    | n
+--------+----
+user    | 8     ← Rust 侧原本不认，建档案直接 400
+admin   | 1
+driver  | 1
+```
+
+10 个用户里 **9 个的 role 是 Rust 侧不认的词**（8 个 `user` + 1 个 `driver`），
+`candidate` / `recruiter` 一个都没有。也就是说：**只要这批用户走 user-service 建档案，
+现在就会 400**；审核员新注册一个号，也一样。
+
 **顺带修掉一个既有缺陷**：`user-service/src/utils/jwt.rs` 的测试模块本来就编译不过
 （`Uuid` 传给了要 `String` 的 `generate_token`，`assert_eq!` 也比错了类型）——
 等于这个包的测试此前从未跑起来过。现已修复。
@@ -146,3 +160,22 @@ GET    /v1/account/preview  # 只读预演，前端二次确认用
 5. 订阅页合规文案
 
 前两步做完，"提交即拒"的三条里就只剩 Apple 登录（依赖你的 ASC 配置）。
+
+---
+
+## 五、执行前后都跑一次预检
+
+```bash
+# 只读，不建表不改数据，不需要先装任何函数
+psql "$GENZLTD_DATABASE_URL" -f shared/preflight_review_blockers.sql
+```
+
+七段检查，期望值写在注释里。已在 `genzltd_sim` 上验证可跑通，输出的关键指标：
+
+| 指标 | 值 |
+|---|---|
+| users 外键 | 37 裸 FK + 3 CASCADE + 1 SET NULL = 41 |
+| 有 user_id 无外键的表 | 5 张（含 iap_subscriptions） |
+| poems | 58,059 行 |
+| users | 10 行，role 分布 user 8 / admin 1 / driver 1 |
+
