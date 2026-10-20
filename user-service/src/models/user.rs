@@ -50,6 +50,64 @@ impl std::fmt::Display for UserRole {
     }
 }
 
+impl UserRole {
+    /// 把各路来源的 role 词汇归一成本服务的三值枚举。
+    ///
+    /// 背景：平台侧（genzltd）的 `users.role` CHECK 只允许
+    /// `user / enterprise / admin / driver`，而本服务（adirp_user）用
+    /// `candidate / recruiter / admin`。网关签发的 JWT 可能带任一套词汇，
+    /// 直接 match 会让平台词汇在建档时 400。
+    ///
+    /// 归一规则（唯一一处，避免各调用点各写一份 match）：
+    /// - candidate / user / driver → Candidate（司机在求职侧也是供给方）
+    /// - recruiter / enterprise     → Recruiter
+    /// - admin                      → Admin
+    ///
+    /// 返回 `None` 表示未知词汇（如 observer）——调用方**必须拒绝**，
+    /// 不得兜底成 candidate，否则无权限用户会被静默建档。
+    pub fn from_any(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "candidate" | "user" | "driver" => Some(UserRole::Candidate),
+            "recruiter" | "enterprise" => Some(UserRole::Recruiter),
+            "admin" => Some(UserRole::Admin),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::UserRole;
+
+    #[test]
+    fn native_vocabulary_is_accepted() {
+        assert_eq!(UserRole::from_any("candidate"), Some(UserRole::Candidate));
+        assert_eq!(UserRole::from_any("recruiter"), Some(UserRole::Recruiter));
+        assert_eq!(UserRole::from_any("admin"), Some(UserRole::Admin));
+    }
+
+    #[test]
+    fn platform_vocabulary_maps_to_native() {
+        assert_eq!(UserRole::from_any("user"), Some(UserRole::Candidate));
+        assert_eq!(UserRole::from_any("driver"), Some(UserRole::Candidate));
+        assert_eq!(UserRole::from_any("enterprise"), Some(UserRole::Recruiter));
+    }
+
+    #[test]
+    fn unknown_role_stays_unknown() {
+        // 0c40b6f 的既定语义：observer 等未知值必须拒绝，不得兜底 candidate
+        assert_eq!(UserRole::from_any("observer"), None);
+        assert_eq!(UserRole::from_any(""), None);
+        assert_eq!(UserRole::from_any("   "), None);
+    }
+
+    #[test]
+    fn case_and_whitespace_are_normalized() {
+        assert_eq!(UserRole::from_any(" ADMIN "), Some(UserRole::Admin));
+        assert_eq!(UserRole::from_any("Enterprise"), Some(UserRole::Recruiter));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "String(Some(20))")]
 pub enum UserStatus {
