@@ -40,7 +40,9 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use common::entities::{apple_iap_transactions, iap_subscriptions, users};
-use common::looma::{fail, resolve_principal, AppState, AuthMode, Principal};
+use common::looma::{
+    fail, resolve_principal_with, AppState, AuthMode, Principal, Provision,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
@@ -222,7 +224,9 @@ async fn verify(
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
 ) -> Response {
-    let principal = match resolve_principal(&state, &headers, AuthMode::Required).await {
+    // 写钱路径：禁止隐式建档（P0-1）。认不出身份 ⇒ 409 need_link，
+    // 让客户端先显式绑定/建档，绝不能把订阅记到新开的孤儿 user 上。
+    let principal = match resolve_payer(&state, &headers).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -259,7 +263,9 @@ async fn restore(
     headers: HeaderMap,
     Json(body): Json<RestoreBody>,
 ) -> Response {
-    let principal = match resolve_principal(&state, &headers, AuthMode::Required).await {
+    // 写钱路径：禁止隐式建档（P0-1）。认不出身份 ⇒ 409 need_link，
+    // 让客户端先显式绑定/建档，绝不能把订阅记到新开的孤儿 user 上。
+    let principal = match resolve_payer(&state, &headers).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -572,6 +578,16 @@ async fn upsert_subscription(
         .exec(db)
         .await?;
     Ok(())
+}
+
+/// 写钱路径的身份解析：**禁止隐式建档**（堵 P0-1）。
+///
+/// 与其它服务的 `resolve_principal(.., AuthMode::Required)` 的差别只有一点：
+/// `users` 里既没有 `supabase_uid == sub` 的行、也没有能唯一命中的 email 时，
+/// 这里不会新开一行，而是返回 `409 need_link`（`{"error":"need_link","reason":…}`），
+/// 由客户端先做显式绑定/建档，再回来 verify。
+async fn resolve_payer(state: &AppState, headers: &HeaderMap) -> Result<Principal, Response> {
+    resolve_principal_with(state, headers, AuthMode::Required, Provision::NoAutoCreate).await
 }
 
 /// `UPDATE users SET tier = ? WHERE id = ?`（每请求查库 ⇒ 下一请求即生效）。
