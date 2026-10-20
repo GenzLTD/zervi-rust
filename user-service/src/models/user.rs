@@ -65,6 +65,17 @@ impl UserRole {
     ///
     /// 返回 `None` 表示未知词汇（如 observer）——调用方**必须拒绝**，
     /// 不得兜底成 candidate，否则无权限用户会被静默建档。
+    ///
+    /// # 使用边界（重要）
+    ///
+    /// 本函数只做**市场轴**（求职侧 / 企业侧）的档案词汇归一，
+    /// 产出的是"这个人以什么身份出现在市场上"。
+    /// 它**不得**用于任何授权判定：
+    /// - 不等于记忆库 participant（记忆库仍是全局库，recall 不按 actor_sub 过滤）
+    /// - 不写入 GFCC 八角梯 `roles[]`
+    /// - 不改变任何门禁结果（例如上传闸门对 candidate 的拒绝照旧）
+    ///
+    /// 否则 `driver → Candidate` 这条归一会被当成提权路径。
     pub fn from_any(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "candidate" | "user" | "driver" => Some(UserRole::Candidate),
