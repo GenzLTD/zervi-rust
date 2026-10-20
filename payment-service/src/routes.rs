@@ -575,16 +575,31 @@ async fn upsert_subscription(
 }
 
 /// `UPDATE users SET tier = ? WHERE id = ?`（每请求查库 ⇒ 下一请求即生效）。
+///
+/// P1-1：必须校验 `rows_affected == 1`。0 行意味着 `user_id` 在 `users` 里不存在
+/// （例如误传了 `sha256(sub)` 而不是 `users.id`），旧代码照样回 200 + `"tier":"pro"`，
+/// 于是"买完没生效、日志还干净"。现在 0 行 ⇒ 记 error 并按 DB 错误上抛（→ 500）。
 async fn set_user_tier(
     db: &sea_orm::DatabaseConnection,
     user_id: &str,
     tier: &str,
 ) -> Result<(), sea_orm::DbErr> {
-    users::Entity::update_many()
+    let outcome = users::Entity::update_many()
         .col_expr(users::Column::Tier, Expr::value(tier))
         .filter(users::Column::Id.eq(user_id))
         .exec(db)
         .await?;
+
+    if outcome.rows_affected != 1 {
+        tracing::error!(
+            user_id = %user_id,
+            tier = %tier,
+            rows_affected = outcome.rows_affected,
+            "set_user_tier: 期望更新 1 行，实际 {} 行 —— user_id 与 users.id 不匹配（孤儿 user_id 或已删号），拒绝按成功返回",
+            outcome.rows_affected
+        );
+        return Err(sea_orm::DbErr::RecordNotUpdated);
+    }
     Ok(())
 }
 
