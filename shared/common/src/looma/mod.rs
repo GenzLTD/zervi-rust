@@ -8,7 +8,7 @@ mod error;
 mod quota;
 mod x1;
 
-pub use auth::{require_tier, resolve_principal, AuthMode, Principal};
+pub use auth::{require_tier, resolve_principal, resolve_principal_with, AuthMode, Principal, Provision};
 pub use consent::require_consent;
 pub use error::{fail, fail_extra, LoomaError};
 pub use quota::{consume_daily, Resource};

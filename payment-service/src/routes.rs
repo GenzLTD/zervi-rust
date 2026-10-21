@@ -40,7 +40,9 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use common::entities::{apple_iap_transactions, iap_subscriptions, users};
-use common::looma::{fail, resolve_principal, AppState, AuthMode, Principal};
+use common::looma::{
+    fail, resolve_principal_with, AppState, AuthMode, Principal, Provision,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
@@ -222,7 +224,9 @@ async fn verify(
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
 ) -> Response {
-    let principal = match resolve_principal(&state, &headers, AuthMode::Required).await {
+    // 写钱路径：禁止隐式建档（P0-1）。认不出身份 ⇒ 409 need_link，
+    // 让客户端先显式绑定/建档，绝不能把订阅记到新开的孤儿 user 上。
+    let principal = match resolve_payer(&state, &headers).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -259,7 +263,9 @@ async fn restore(
     headers: HeaderMap,
     Json(body): Json<RestoreBody>,
 ) -> Response {
-    let principal = match resolve_principal(&state, &headers, AuthMode::Required).await {
+    // 写钱路径：禁止隐式建档（P0-1）。认不出身份 ⇒ 409 need_link，
+    // 让客户端先显式绑定/建档，绝不能把订阅记到新开的孤儿 user 上。
+    let principal = match resolve_payer(&state, &headers).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -574,17 +580,42 @@ async fn upsert_subscription(
     Ok(())
 }
 
+/// 写钱路径的身份解析：**禁止隐式建档**（堵 P0-1）。
+///
+/// 与其它服务的 `resolve_principal(.., AuthMode::Required)` 的差别只有一点：
+/// `users` 里既没有 `supabase_uid == sub` 的行、也没有能唯一命中的 email 时，
+/// 这里不会新开一行，而是返回 `409 need_link`（`{"error":"need_link","reason":…}`），
+/// 由客户端先做显式绑定/建档，再回来 verify。
+async fn resolve_payer(state: &AppState, headers: &HeaderMap) -> Result<Principal, Response> {
+    resolve_principal_with(state, headers, AuthMode::Required, Provision::NoAutoCreate).await
+}
+
 /// `UPDATE users SET tier = ? WHERE id = ?`（每请求查库 ⇒ 下一请求即生效）。
+///
+/// P1-1：必须校验 `rows_affected == 1`。0 行意味着 `user_id` 在 `users` 里不存在
+/// （例如误传了 `sha256(sub)` 而不是 `users.id`），旧代码照样回 200 + `"tier":"pro"`，
+/// 于是"买完没生效、日志还干净"。现在 0 行 ⇒ 记 error 并按 DB 错误上抛（→ 500）。
 async fn set_user_tier(
     db: &sea_orm::DatabaseConnection,
     user_id: &str,
     tier: &str,
 ) -> Result<(), sea_orm::DbErr> {
-    users::Entity::update_many()
+    let outcome = users::Entity::update_many()
         .col_expr(users::Column::Tier, Expr::value(tier))
         .filter(users::Column::Id.eq(user_id))
         .exec(db)
         .await?;
+
+    if outcome.rows_affected != 1 {
+        tracing::error!(
+            user_id = %user_id,
+            tier = %tier,
+            rows_affected = outcome.rows_affected,
+            "set_user_tier: 期望更新 1 行，实际 {} 行 —— user_id 与 users.id 不匹配（孤儿 user_id 或已删号），拒绝按成功返回",
+            outcome.rows_affected
+        );
+        return Err(sea_orm::DbErr::RecordNotUpdated);
+    }
     Ok(())
 }
 
