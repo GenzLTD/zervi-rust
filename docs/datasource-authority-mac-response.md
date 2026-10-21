@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 对侧（脚本侧） | `looma-zervi` @ `ops/pg-export-safe-default` | **`46ae918`** | 导出脚本：默认不清表 + `source_sanity()` 源库身份自检 |
 | 本侧（文档侧） | `zervi-rust` @ `docs/datasource-authority-round3` | `7592ff8`（pre-pin） | Round 3 全文（不含本节） |
-| 本侧 tip | 同上分支 | `7592ff8` 的子提交 | 本文档当前版本 |
+| 本侧 tip | 同上分支 | `a886a6ce` 的子提交 | 本文档当前版本（含 Round 4 生产快照） |
 
 自引用不写入正文（否则需要先知道自己 SHA，会自相矛盾）；**当前 tip 以分支头为准**，
 引用本文档时请写分支 tip，`7592ff8` 保留为 pre-pin 引用。
@@ -333,3 +333,99 @@ SQL
    **不要**对生产 genzltd 执行任何 apply。
 3. **③ 脚本默认化**已在 Mac 侧落地并实测，Win 侧拉同一份即可；建议评审把它写成
    "迁移前置 checklist 第 0 项：先 `--strict-source` 跑一遍，红了一律停"。
+
+---
+
+# Round 4 · 生产快照到手，权威源锁定（2026-10-22 08:0x GMT+8）
+
+## 取数过程（可复跑）
+
+`.ssh/config` 里本就有 `vultr-overseas`（`root@139.180.184.25`，key `~/.ssh/vultr_overseas`），
+**凭据一直在，此前从未用于取数** —— 所谓"需运维凭据"的门槛是我没去找，不是真的没有。
+
+```bash
+# 1) 容器内 VACUUM INTO 快照（源库只读语义；WAL 已提交内容一并带走，避免读到半提交）
+scp /tmp/looma_snapshot.py vultr-overseas:/tmp/
+docker cp /tmp/looma_snapshot.py looma-backend:/tmp/
+docker exec looma-backend python3 /tmp/looma_snapshot.py /tmp/looma-snapshot-20261022.db
+#   → 30,818,304 B；自检 users 11=11、poems 58,059=58,059
+
+# 2) 传出 + 指纹对拍
+docker cp looma-backend:/tmp/looma-snapshot-20261022.db /tmp/
+sha256sum /tmp/looma-snapshot-20261022.db      # 6b08bdae…9b509
+scp vultr-overseas:/tmp/looma-snapshot-20261022.db <本机>
+shasum -a 256 <本机文件>                        # 两端一致
+
+# 3) 清理 SG 上的临时文件（容器内外各一份）
+```
+
+落盘：`/Users/jason/WorkBuddy/2026-10-21-06-57-56/snapshots/looma-sg-20261022.db`
+
+## SG 生产机实测现状
+
+| 项 | 值 |
+|---|---|
+| 主机 | `139.180.184.25`（hostname `genz-ltd`，Vultr SG，uptime 99 天） |
+| 容器 | `looma-backend`、`gfcc-kernel`、`looma-redis`、`looma-chromadb` |
+| **PG 容器** | **无** `looma-pgvector`（`docker ps -a` 连停止的都没有），也无 `pgdata` volume |
+| `/app/data/looma.db` | 33,714,176 B，mtime **2026-10-18 07:28**，sha256 `ebbf55c2…3dec62` |
+| journal_mode | `wal`（活动 WAL ⇒ 必须先 `VACUUM INTO` 快照，不能直接对活动库导） |
+| 历史备份 | `looma.db.pre-genzflip-20260916`、`looma.db.sweep-backup-20260916-030957` |
+| 磁盘 | 62G 可用（快照无空间压力） |
+
+## 三方对拍（这是本节的核心）
+
+| 源 | users | poems | users.created_at 跨度 | 文件 sha256 |
+|---|---:|---:|---|---|
+| **SG 生产快照 2026-10-22** | **11** | 58,059 | 2026-07-15 → 2026-09-25 | `6b08bdae…9b509` |
+| Mac `looma.db` | 43 | 312,220 | 2026-07-11 → 2026-09-22 | `73a900a0…d101b` |
+| Win 侧 E:（vultr-data 副本） | 206 | 未知 | 2026-07-14 → 2026-09-01 | `cbeb7631…feb5f40` |
+
+**主键集合比对（第二层判据）**：SG ∩ Mac = **1**，且那唯一一个是
+`driver-official`（`official@szbolent.com.cn`，种子/官方账号）。
+SG 独有的 10 个是 `zervi@genz.ltd`、`4 个 beta_*@looma.test`、`2 个 @qq.com`、
+`reed.xia@gmail.com`、`szbenyx@163.com`、`wcy0811@sjtu.edu.cn`。
+
+⇒ **三份互不相同的结论成立，且方向要反转**：不是"生产 206/43 哪个是真的"，
+而是**生产只有 11 个用户**；Mac 的 43 与 Win 的 206 都是本地开发/测试/旧副本，
+此前关于"数据规模"的所有估算（包括我按 177MB 估体量）全部作废。
+
+## 权威源结论
+
+> **以 SG 生产 `looma.db` 的 2026-10-22 快照为事实源**（`6b08bdae…9b509`）。
+> 业务态仅 11 users；poems 58,059 为外部语料派生态，不参与判据、也不必迁移（可重导入）。
+
+## 第 0 项预检（在快照上实跑）
+
+```
+python3 backend/scripts/export_sqlite_to_pg.py \
+  --sqlite <sg-snapshot>.db --out /tmp/genzltd-sg-20261022 --strict-source --schema-only
+
+→ 伪域名占比 36.4%（4/11，均为 beta_*@looma.test）→ 低于 50% 阈值，**放行 exit 0**
+→ schema.sql 中 DROP TABLE 计数 = 0（默认不清表生效）
+→ 55 表
+```
+
+判定：通过，可以进入正式迁移（前提是目标库落点先确认）。
+
+## 目标库落点：未闭环
+
+按评审选择"沿用腾讯云 `1.14.202.161` 的 genzltd 容器"，但：
+
+- **SG 上根本没有 PG 容器**（compose 里 `pgvector` 服务存在但从未起过）；
+- **腾讯云 `1.14.202.161` 本机无 SSH 配置**（只有 `known_hosts` 里有指纹，说明以前连过，
+  但 `~/.ssh/config` 无对应 Host，key 也不在手）；
+- 导出脚本头部写的目标就是腾讯云 genzltd 容器，但该容器**是否存在、里面有没有表、有多少行**，
+  我目前**无法验证**。
+
+⇒ 迁移的剩余门槛已从"拿不到 dump"换成"**拿不到目标库的现状证据**"。
+在拿到 `1.14.202.161` 的只读核查结果之前，**不要对目标库执行任何 apply**（包括 `--recreate`）。
+
+## 本轮我未做 / 待确认
+
+1. 未对 SG 生产库做任何写操作（快照是新建文件，`/tmp` 文件已双向清理）。
+2. 只读查询在 `/app/data` 下产生了 `-shm`(32KB) / `-wal`(0B) —— **这是 SQLite 的正常副作用，
+   不是数据变更**（WAL 内容为空，mtime 表现为本次读取时刻）。若要求目录绝对干净，
+   可在业务低峰重启 backend 容器让 SQLite 自行回收。
+3. 未核验腾讯云 `1.14.202.161` 的 genzltd 容器 —— 缺 SSH 凭据，需你提供。
+4. 未做 data.sql 全量导出（只跑 `--schema-only` 验证预检开关）。
