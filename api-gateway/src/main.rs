@@ -1,9 +1,9 @@
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
-    http::{header, Method, StatusCode, Uri},
+    extract::{Request, State},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{any, post},
+    routing::{any, get, post},
     Router,
 };
 use consul_client::ServiceDiscovery;
@@ -27,53 +27,148 @@ struct AppState {
 /// 以 `#[cfg(test)] mod tests` 形式放在本文件内。
 ///
 /// 路由、CORS、state 构造与抽离前**逐行一致**，不含任何逻辑改动。
+
+/// looma 单体后端（Flask）端口 —— 过渡期兜底目标。
+/// 本轮未迁移的 Blueprint（auth / payment / poetry / game / trust / compliance ...）仍在 :5200。
+const LOOMA_LEGACY_PORT: u16 = 5200;
+
 fn app() -> Router {
     // 创建状态
+    //
+    // ⚠️ `reqwest` 默认会读取环境变量 `HTTP_PROXY` / `HTTPS_PROXY`，
+    // 但网关做的是**内网服务间调用**（Consul 服务发现 + localhost 回落），
+    // 走外部代理会带来三个问题：
+    //   1. 请求行退化为 absolute-form（`GET http://localhost:3004/v1/xxx`），
+    //      与 looma 直连语义不一致；
+    //   2. 每次转发多一跳，延迟与失败面扩大；
+    //   3. 代理不可用时整个网关瘫痪。
+    // ⇒ 显式 `no_proxy()`，服务间调用一律直连。
+    let http_client = Client::builder()
+        .no_proxy()
+        .build()
+        .expect("failed to build reqwest client");
+
     let state = AppState {
-        http_client: Client::new(),
+        http_client,
         service_discovery: Arc::new(ServiceDiscovery::new()),
     };
 
-    // 配置CORS
+    // 配置 CORS（前端走 Bearer header，不用 cookie ⇒ 无需 allow_credentials）
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     // 构建路由
+    // 口径（2026-10-16 拍板）：
+    //   · 对外只暴露 /v1/*（无 /api 层，也不加 /api/v1/* 别名）
+    //   · 转发保留**完整原始 path+query**（不剥前缀）⇒ 下游服务可与 looma 逐字对齐
+    //   · 鉴权**不在网关裁决**：Authorization 原样透传，由服务层按 looma 装饰器语义收口
+    //   · 未迁移的 looma Blueprint 由 fallback 兜到 :5200
     Router::new()
+        // ── 网关自有端点 ────────────────────────────────────────────────
         .route("/health", axum::routing::get(health_check))
         // GFCC ask 单入口：网关鉴权后转发到 Tatha 主仓（Python 中央大脑）
         .route("/v1/ask", post(tatha::ask))
         // 量子认证兼容端点：Tatha 的 QUANTUM_AUTH_URL 指向此处
-        .route("/v1/auth/verify", axum::routing::get(tatha::verify))
-        // 认证服务路由
+        .route("/v1/auth/verify", get(tatha::verify))
+
+        // ── resume-service · /v1/resume/* (7) ───────────────────────────
+        .route("/v1/resume/parse", any(route_to_resume_service))
+        .route("/v1/resume/upload", any(route_to_resume_service))
+        .route("/v1/resume/ingest", any(route_to_resume_service))
+        .route("/v1/resume/improve", any(route_to_resume_service))
+        .route("/v1/resume/list", any(route_to_resume_service))
+        .route("/v1/resume/analysis", any(route_to_resume_service))
+        .route("/v1/resume/:resume_id", any(route_to_resume_service))
+
+        // ── job-service · /v1/jobs/* (9) ────────────────────────────────
+        // #12 根路径：looma 侧 strict_slashes=False（/v1/jobs 与 /v1/jobs/ 都收）；
+        // 尾斜杠版本轮落 fallback → :5200，行为仍与 looma 一致。
+        .route("/v1/jobs", any(route_to_job_service))
+        .route("/v1/jobs/list", any(route_to_job_service))
+        .route("/v1/jobs/upload", any(route_to_job_service))
+        .route("/v1/jobs/parse", any(route_to_job_service))
+        .route("/v1/jobs/match", any(route_to_job_service))
+        .route("/v1/jobs/search", any(route_to_job_service))
+        .route("/v1/jobs/seed-demo", any(route_to_job_service))
+        .route("/v1/jobs/recommend", any(route_to_job_service))
+        .route("/v1/jobs/:job_id", any(route_to_job_service))
+
+        // ── job-service · /v1/job-posts (5) ──  双轨 B 轨入口
+        .route("/v1/job-posts", any(route_to_job_service))
+        .route("/v1/job-posts/:post_id", any(route_to_job_service))
+        .route("/v1/job-posts/:post_id/matches", any(route_to_job_service))
+
+        // ── application-service · /v1/application/* (5) ─────────────────
+        .route("/v1/application", any(route_to_application_service))
+        .route(
+            "/v1/application/:application_id",
+            any(route_to_application_service),
+        )
+        .route(
+            "/v1/application/:application_id/report",
+            any(route_to_application_service),
+        )
+        // #27 D6：跨前缀路径 `/v1/jobs/<job_id>/applications` → application-service
+        //（matchit 中 param 分支比 wildcard/static 兄弟节点独立建树，与 `/v1/jobs/:job_id` 不冲突）
+        .route(
+            "/v1/jobs/:job_id/applications",
+            any(route_to_application_service),
+        )
+
+        // ── company-service · /v1/enterprise/* (8) ──────────────────────
+        // 对外路径用 looma 的 enterprise 命名；crate 名保持 company-service（已拍板不改）
+        .route("/v1/enterprise/create", any(route_to_company_service))
+        .route("/v1/enterprise/join", any(route_to_company_service))
+        .route("/v1/enterprise/profile", any(route_to_company_service))
+        .route("/v1/enterprise/candidates", any(route_to_company_service))
+        .route(
+            "/v1/enterprise/candidate/:candidate_id",
+            any(route_to_company_service),
+        )
+        .route(
+            "/v1/enterprise/candidates/import-share",
+            any(route_to_company_service),
+        )
+        .route(
+            "/v1/enterprise/candidates/add",
+            any(route_to_company_service),
+        )
+        .route(
+            "/v1/enterprise/contact-sales",
+            any(route_to_company_service),
+        )
+
+        // ── 过渡期 /api/v1/* 通路（main 侧既有，非 looma 35 端点口径）──────
+        // 合并说明：上面的 /v1/* 是新口径（10-16 拍板），但 auth / user /
+        // upload / slice 这几个 Blueprint 尚未迁到 /v1/*，GFCC 终端仍在打
+        // /api/v1/slice/*。原 #8 分支重写路由表时把整段 /api/v1/* 删掉了，
+        // 那会让终端 job_match 通路静默失效 ⇒ 此处显式补回。
+        // *path 不做抽取由 handler 自行处理，`any()` 仍可匹配。
         .route("/api/v1/auth/*path", any(route_to_auth_service))
-        // 用户服务路由
         .route("/api/v1/user/*path", any(route_to_user_service))
-        // 简历服务路由
         .route("/api/v1/resume/*path", any(route_to_resume_service))
-        // 职位服务路由
         .route("/api/v1/job/*path", any(route_to_job_service))
-        // 投递服务路由
         .route(
             "/api/v1/application/*path",
             any(route_to_application_service),
         )
-        // JobFirst M0 Slice（收件箱）
         .route("/api/v1/slice/*path", any(route_to_jobfirst_slice))
-        // 企业服务路由
         .route("/api/v1/company/*path", any(route_to_company_service))
-        // 上传服务路由
         .route("/api/v1/upload/*path", any(route_to_upload_service))
-        // 临时：转发到旧的单体应用（Week 1使用）
         .route("/api/*path", any(route_to_legacy_backend))
+
+        // ── 其余 looma Blueprint（auth 除 verify 外 / payment / poetry /
+        //    game / trust / compliance / reports / ...）→ 仍在 :5200 ──────
+        .fallback(route_to_legacy_backend)
         .layer(cors)
         .with_state(state)
 }
@@ -90,23 +185,24 @@ async fn main() -> anyhow::Result<()> {
 
     let app = app();
 
-    // 启动服务器（使用用户指定的3333端口）
+    // 启动服务器（用户指定 3333 端口）
     let addr = SocketAddr::from(([0, 0, 0, 0], 3333));
     info!("✅ API Gateway listening on http://{}", addr);
     info!("📍 Consul: http://localhost:8500");
-    info!("🔍 Routes:");
+    info!("🔍 Routes (looma /v1/* contract, 35 endpoints + gateway-owned):");
     info!("   - /health                    -> Health check");
     info!("   - /v1/ask                    -> tatha (Python brain, gated)");
     info!("   - /v1/auth/verify            -> token introspection for tatha");
-    info!("   - /api/v1/auth/*             -> auth-service");
-    info!("   - /api/v1/user/*             -> user-service");
-    info!("   - /api/v1/resume/*           -> resume-service");
-    info!("   - /api/v1/job/*              -> job-service");
-    info!("   - /api/v1/application/*      -> application-service");
-    info!("   - /api/v1/slice/*            -> jobfirst-slice-service");
-    info!("   - /api/v1/company/*          -> company-service");
-    info!("   - /api/v1/upload/*           -> upload-service");
-    info!("   - /api/*                     -> legacy backend (temp)");
+    info!("   - /v1/resume/*          (7)  -> resume-service");
+    info!("   - /v1/jobs/*            (9)  -> job-service");
+    info!("   - /v1/job-posts*        (5)  -> job-service (双轨 B)");
+    info!("   - /v1/application/*     (5)  -> application-service");
+    info!("   - /v1/jobs/:id/applications  -> application-service (D6 跨前缀)");
+    info!("   - /v1/enterprise/*      (8)  -> company-service");
+    info!(
+        "   - * (fallback)               -> looma legacy :{}",
+        LOOMA_LEGACY_PORT
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -118,110 +214,100 @@ async fn health_check() -> &'static str {
     "OK - API Gateway is running"
 }
 
-// 路由处理函数
-async fn route_to_auth_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "auth-service", 3001, &path, req).await
+// ── 路由处理函数 ───────────────────────────────────────────────────────────
+
+async fn route_to_resume_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "resume-service", 3003, req).await
 }
 
-async fn route_to_user_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "user-service", 3002, &path, req).await
+async fn route_to_job_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "job-service", 3004, req).await
 }
 
-async fn route_to_resume_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "resume-service", 3003, &path, req).await
+async fn route_to_application_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "application-service", 3005, req).await
 }
 
-async fn route_to_job_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "job-service", 3004, &path, req).await
+async fn route_to_company_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "company-service", 3006, req).await
 }
 
-async fn route_to_application_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "application-service", 3005, &path, req).await
+// ── 以下服务本轮不注册（对应 Blueprint 仍在 looma :5200，注册会抢走 looma 端点）──
+//    auth-service  → looma auth_bp 仍在 :5200（仅 /v1/auth/verify 由网关自有）
+//    user-service  → looma 无独立 user 路由组
+//    upload-service→ looma 的上传在 /v1/resume/upload、/v1/jobs/upload（属 resume/job 域）
+//    jobfirst-slice → 非 35 端点，端口已从 3005 让到 3008（解 D7 冲突），待后续轮次
+//    保留实现供后续接入。
+
+#[allow(dead_code)]
+async fn route_to_auth_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "auth-service", 3001, req).await
 }
 
-/// `/api/v1/slice/*` —— 终端侧的 job_match 适配器入口。
+#[allow(dead_code)]
+async fn route_to_user_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "user-service", 3002, req).await
+}
+
+/// `/api/v1/slice/*` —— JobFirst M0 Slice（收件箱），终端侧 job_match 适配器入口。
 ///
 /// 与 `/v1/ask` 共用 `authenticate_and_stamp`：先验 token，再注入
 /// `X-Actor-Sub`（原始 sub）与 `X-User-Id`（sha256(sub)）。此前这条路由是
 /// **纯透传**：匿名也能写简历、读收件箱，且下游拿不到任何身份 ——
 /// GFCC 1.3.0 要求 `job_match` 结果只能以 `weight: auxiliary` 喂
 /// `identity.capability_trace`，没有 actor 就无法归因，适配器等于不可用。
-async fn route_to_jobfirst_slice(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    uri: Uri,
-    mut req: Request,
-) -> Response {
+///
+/// 合并说明（PR #8 × main）：main 原先手工把 query 拼回 path 再传给下游，
+/// 是因为当时的 `route_to_service` 会丢 query；本分支合并后采信 main.rs 底部
+/// `route_to_service` 的 D2 口径 —— 内部统一保留**完整原始 path+query**，
+/// 因此此处不再提取 `Path`，直接透传 `req` 即可，语义与旧实现等价。
+async fn route_to_jobfirst_slice(State(state): State<AppState>, mut req: Request) -> Response {
     if let Err(resp) = tatha::authenticate_and_stamp(&mut req).await {
-        tracing::warn!("🚫 /api/v1/slice/{} rejected: no identity", path);
+        tracing::warn!("🚫 /api/v1/slice rejected: no identity");
         return resp;
     }
-    // `Path` 只给出路径段，query 会被丢掉；`matches` / `inbox` 都靠 query 传
-    // `resume_id`，不补回去下游就会报「missing field resume_id」。
-    let path = match uri.query() {
-        Some(q) => format!("{}?{}", path, q),
-        None => path,
-    };
-    route_to_service(&state, "jobfirst-slice-service", 3005, &path, req).await
+    // D7：端口让到 3008，避免与 application-service（3005）撞车。
+    route_to_service(&state, "jobfirst-slice-service", 3008, req).await
 }
 
-async fn route_to_company_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "company-service", 3006, &path, req).await
+#[allow(dead_code)]
+async fn route_to_upload_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "upload-service", 3007, req).await
 }
 
-async fn route_to_upload_service(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    route_to_service(&state, "upload-service", 3007, &path, req).await
-}
-
-// 临时：路由到旧的单体应用
-async fn route_to_legacy_backend(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    // Week 1使用：直接转发到旧的单体应用
-    let fallback_url = format!("http://localhost:3000/{}", path);
-    info!("🔄 Routing to legacy backend: {}", fallback_url);
+/// 兜底：转发到 looma 单体后端（:5200），**保留完整原始 path+query**。
+async fn route_to_legacy_backend(State(state): State<AppState>, req: Request) -> Response {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let fallback_url = format!("http://localhost:{}{}", LOOMA_LEGACY_PORT, path_and_query);
+    info!("🔄 Routing to looma legacy backend: {}", fallback_url);
     proxy_request(&state.http_client, &fallback_url, req).await
 }
 
-// 核心服务发现和路由逻辑
+// ── 核心服务发现和路由逻辑 ─────────────────────────────────────────────────
+
+/// 转发到注册在 Consul 的服务；Consul 未命中时回落到 localhost:{fallback_port}。
+///
+/// **D2 关键**：转发保留**完整原始 path+query**（早前实现取 `Path(path)` 后
+/// `format!("{}/{}", url, path)` 会剥掉 `/v1/xxx` 前缀，导致下游只能收到 `/parse`，
+/// 服务内路由无法与 looma 对齐）。
 async fn route_to_service(
     state: &AppState,
     service_name: &str,
     fallback_port: u16,
-    path: &str,
     req: Request,
 ) -> Response {
-    // 1. 从Consul发现服务
+    // 保留完整原始 path + query
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    // 1. 从 Consul 发现服务
     let service_url = match state.service_discovery.discover_service(service_name).await {
         Ok(Some(url)) => {
             info!("✅ Discovered {} at {}", service_name, url);
@@ -240,15 +326,15 @@ async fn route_to_service(
         }
     };
 
-    // 2. 构建完整URL
-    let target_url = format!("{}/{}", service_url, path);
+    // 2. 构建完整 URL（保留完整路径，不剥前缀）
+    let target_url = format!("{}{}", service_url.trim_end_matches('/'), path_and_query);
     info!("🔄 Proxying to: {}", target_url);
 
-    // 3. 转发请求
+    // 3. 转发请求（Authorization 原样透传，网关不做身份裁定）
     proxy_request(&state.http_client, &target_url, req).await
 }
 
-// HTTP代理实现
+// HTTP 代理实现
 async fn proxy_request(client: &Client, target_url: &str, req: Request) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
@@ -263,7 +349,7 @@ async fn proxy_request(client: &Client, target_url: &str, req: Request) -> Respo
         }
     };
 
-    // 转换method为reqwest的Method
+    // 转换 method 为 reqwest 的 Method
     let reqwest_method = match method.as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -278,10 +364,12 @@ async fn proxy_request(client: &Client, target_url: &str, req: Request) -> Respo
         }
     };
 
-    // 构建reqwest请求
+    // 构建 reqwest 请求
     let mut req_builder = client.request(reqwest_method, target_url);
 
-    // 复制headers（跳过某些不应该转发的headers）
+    // 复制 headers（跳过不应转发的）
+    // 注意：Authorization **原样透传** —— 网关不注入 X-User-Id / X-User-Tier，
+    // 由服务层按 looma `require_auth`/`optional_auth` 语义收口到 users.id。
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
         if name_str != "host" && name_str != "connection" {

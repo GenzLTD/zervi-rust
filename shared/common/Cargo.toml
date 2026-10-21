@@ -12,4 +12,6 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 sea-orm.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
 
