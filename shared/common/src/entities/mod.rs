@@ -3,6 +3,7 @@
 pub mod prelude;
 
 pub mod act1_sessions;
+pub mod apple_iap_transactions;
 pub mod applications;
 pub mod audit_logs;
 pub mod boost_consumptions;
@@ -21,6 +22,7 @@ pub mod fleet_members;
 pub mod fleets;
 pub mod game_profiles;
 pub mod huawei_push_tokens;
+pub mod iap_subscriptions;
 pub mod invite_codes;
 pub mod job_posts;
 pub mod llm_usage;
