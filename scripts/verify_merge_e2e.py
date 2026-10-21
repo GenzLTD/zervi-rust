@@ -137,13 +137,31 @@ st, _ = call("GET", BASE + "/api/v1/upload/list", token=token)
 mounted("GET /api/v1/upload/list", st)
 
 # ── 5. payment-service（Apple IAP 首次进主线） ────────────────────
-print("\n[5] payment-service（Apple IAP）")
+#
+# 这一段守的是 2026-10-21 修的那个 gap：payment-service 一直在 :3009 跑着，
+# 但网关**没有直通路由**，请求会落到 fallback → looma :5200 ⇒ 客户端经网关
+# 永远调不通支付端点，只能直连 :3009。上架审核要走通收据校验，故此处：
+#   ① 验经网关可达
+#   ② 验经网关与直连的行为一致（防网关层改写/丢失）
+#   ③ 验未注册路径确实会落 fallback（反向对照，证明前两条不是在碰巧 fallback）
+print("\n[5] payment-service（Apple IAP）—— 经网关 :3333 应可达")
 st, body = call("GET", PAY + "/healthz")
-check("GET :3009/healthz", st == 200, "HTTP %s %s" % (st, body.strip()[:20]))
-st, _ = call("POST", PAY + "/v1/payment/apple/verify", {"receipt": "invalid-for-mount-test"})
-mounted("POST /v1/payment/apple/verify", st)
-st, _ = call("POST", PAY + "/v1/payment/apple/restore", {"user_id": "test"})
-mounted("POST /v1/payment/apple/restore", st)
+check("GET :3009/healthz（直连）", st == 200, "HTTP %s %s" % (st, body.strip()[:20]))
+
+for name, path, body_json in [
+    ("verify", "/v1/payment/apple/verify", {"receipt": "mount-probe"}),
+    ("restore", "/v1/payment/apple/restore", {"user_id": "probe"}),
+    ("webhook", "/v1/payment/apple/webhook", {"signedPayload": "probe"}),
+]:
+    gw_st, _ = call("POST", BASE + path, body_json, timeout=20)
+    dp_st, _ = call("POST", PAY + path, body_json, timeout=20)
+    # 502 = 落 fallback(:5200)，说明路由没挂；其它码 = 挂上了
+    mounted("经网关 POST %s" % path, gw_st)
+    check("  └ 经网关与直连一致", gw_st == dp_st, "网关 %s vs 直连 %s" % (gw_st, dp_st))
+
+st_fb, _ = call("POST", BASE + "/v1/payment/apple/definitely-not-registered", {"x": 1})
+check("反向对照：未注册路径应落 fallback(502)", st_fb == 502,
+      "HTTP %s —— 若这里也是 422/500 说明上面三条没真正走直通" % st_fb)
 
 # ── 6. 7B 简历解析字段契约 ───────────────────────────────────────
 print("\n[6] 7B 简历解析字段契约")

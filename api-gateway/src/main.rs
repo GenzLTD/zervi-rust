@@ -35,7 +35,13 @@ struct AppState {
 /// 路由、CORS、state 构造与抽离前**逐行一致**，不含任何逻辑改动。
 
 /// looma 单体后端（Flask）端口 —— 过渡期兜底目标。
-/// 本轮未迁移的 Blueprint（auth / payment / poetry / game / trust / compliance ...）仍在 :5200。
+/// 本轮未迁移的 Blueprint（poetry / game / trust / compliance / reports / ...）
+/// 仍在 :5200。
+///
+/// ⚠️ **payment 已于 2026-10-21 移出本兜底** —— 它此前和上面几个 Blueprint 一样
+/// 写在注释里挂着，但 payment-service 实际已在 :3009 独立运行，只是网关没有
+/// 直通路由 ⇒ 请求走到 fallback 转发到 :5200（那里没有支付实现），
+/// 表现为「服务起来了但经网关访问支付端点永远不通」。已改为显式直通。
 const LOOMA_LEGACY_PORT: u16 = 5200;
 
 fn app() -> Router {
@@ -164,6 +170,20 @@ fn app() -> Router {
             any(route_to_company_service),
         )
 
+        // ── payment-service · /v1/payment/apple/* (3) ───────────────────
+        // Apple IAP（2026-10-21 由 feat/apple-iap 合入主线）。这三个端点由
+        // payment-service 在 :3009 提供，此前网关**没有直通路由**，请求会落到
+        // fallback → looma :5200（那里没有支付实现）⇒ 客户端经网关永远调不通，
+        // 只能直连 :3009。上架审核要走通收据校验，故此处补齐。
+        //
+        // 转发遵循 D2 口径保留完整 path+query，因此网关对外路径与 payment-service
+        // 内部路由逐字相同（/v1/payment/apple/verify 等）。
+        // Apple 的 webhook 由 App Store 服务器回调，无网关鉴权头 —— 鉴权在
+        // payment-service 内部按 Apple 签名校验收口（与网关「不在网关裁决」口径一致）。
+        .route("/v1/payment/apple/webhook", any(route_to_payment_service))
+        .route("/v1/payment/apple/verify", any(route_to_payment_service))
+        .route("/v1/payment/apple/restore", any(route_to_payment_service))
+
         // ── 过渡期 /api/v1/* 通路（main 侧既有，非 looma 35 端点口径）──────
         // 合并说明：上面的 /v1/* 是新口径（10-16 拍板），但 auth / user /
         // upload / slice 这几个 Blueprint 尚未迁到 /v1/*，GFCC 终端仍在打
@@ -183,8 +203,9 @@ fn app() -> Router {
         .route("/api/v1/upload/*path", any(route_to_upload_service))
         .route("/api/*path", any(route_to_legacy_backend))
 
-        // ── 其余 looma Blueprint（auth 除 verify 外 / payment / poetry /
-        //    game / trust / compliance / reports / ...）→ 仍在 :5200 ──────
+        // ── 其余 looma Blueprint（poetry / game / trust / compliance /
+        //    reports / ...）→ 仍在 :5200 ────────────────────────────────
+        //    payment 已不再此列 —— 见上方 /v1/payment/apple/* 直通路由。
         .fallback(route_to_legacy_backend)
         .layer(cors)
         .with_state(state)
@@ -227,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
     info!("   - /v1/application/*     (5)  -> application-service");
     info!("   - /v1/jobs/:id/applications  -> application-service (D6 跨前缀)");
     info!("   - /v1/enterprise/*      (8)  -> company-service");
+    info!("   - /v1/payment/apple/*   (3)  -> payment-service :3009 (Apple IAP)");
     info!(
         "   - * (fallback)               -> looma legacy :{}",
         LOOMA_LEGACY_PORT
@@ -258,6 +280,15 @@ async fn route_to_application_service(State(state): State<AppState>, req: Reques
 
 async fn route_to_company_service(State(state): State<AppState>, req: Request) -> Response {
     route_to_service(&state, "company-service", 3006, req).await
+}
+
+/// Apple 内购支付（paywall / 收据校验 / 订阅恢复）→ payment-service :3009。
+///
+/// 端口 3009 由 payment-service 启动日志实测确认（`payment-service listening
+/// on 0.0.0.0:3009`），不是从既有文档推得 —— 早期笔记里写的 3006/3005 均与
+/// company / application-service 冲突。
+async fn route_to_payment_service(State(state): State<AppState>, req: Request) -> Response {
+    route_to_service(&state, "payment-service", 3009, req).await
 }
 
 // ── 以下服务本轮不注册（对应 Blueprint 仍在 looma :5200，注册会抢走 looma 端点）──
