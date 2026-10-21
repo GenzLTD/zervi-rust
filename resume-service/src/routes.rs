@@ -416,11 +416,36 @@ async fn insert_resume(
     Ok((inserted.id.to_string(), final_path))
 }
 
+/// 简历解析的字段契约。
+///
+/// 之前的提示词只说「提取为 JSON 对象」，等于没有契约，于是模型各自发挥：
+/// · qwen2.5-coder:1.5b → 把「蚂蚁集团支付网关负责人」整段当成公司名，还把期望职位当成现任职位
+/// · qwen2.5:7b         → 改用中文键名（姓名 / 工作经验 / 教育背景），下游拿不到稳定字段
+/// 现在显式给出英文键名与类型，并要求缺失字段留空值。
+fn build_extract_prompt(doc_type: &str, text: &str) -> String {
+    if doc_type.eq_ignore_ascii_case("resume") {
+        format!(
+            "你是简历解析引擎。从下面的简历文本中提取结构化信息。\n\
+             严格要求：\n\
+             1. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记\n\
+             2. 必须使用下列英文键名，不得改名，不得翻译成中文\n\
+             3. 找不到的字段留空字符串、空数组或 0\n\n\
+             输出结构：\n\
+             {{\"name\":\"\",\"gender\":\"\",\"age\":0,\"phone\":\"\",\"email\":\"\",\
+             \"education\":[{{\"school\":\"\",\"major\":\"\",\"degree\":\"\",\"period\":\"\"}}],\
+             \"experience\":[{{\"company\":\"\",\"position\":\"\",\"period\":\"\",\"skills\":[],\"highlights\":[]}}],\
+             \"skills\":[],\
+             \"expectation\":{{\"position\":\"\",\"city\":\"\",\"salary\":\"\"}}}}\n\n\
+             简历文本：\n{text}"
+        )
+    } else {
+        format!("把以下{doc_type}文本提取为 JSON 对象，只输出 JSON。文本：\n{text}")
+    }
+}
+
 async fn analyze(state: &AppState, doc_type: &str, text: &str) -> Result<Value, Response> {
     let clipped: String = text.chars().take(4000).collect();
-    let prompt = format!(
-        "把以下{doc_type}文本提取为 JSON 对象，只输出 JSON。文本：\n{clipped}"
-    );
+    let prompt = build_extract_prompt(doc_type, &clipped);
     let Some(raw) = common::looma::call_llm(&state.settings, &prompt, 0.1).await else {
         return Err(fail(
             StatusCode::INTERNAL_SERVER_ERROR,

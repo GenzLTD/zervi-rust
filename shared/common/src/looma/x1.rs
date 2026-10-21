@@ -21,6 +21,7 @@ pub struct Settings {
     pub openai_model: String,
     pub ollama_host: String,
     pub ollama_model: String,
+    pub ollama_num_ctx: u32,
     pub qcc_mcp_base_url: String,
 }
 
@@ -49,6 +50,13 @@ impl Settings {
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
             ollama_model: std::env::var("OLLAMA_MODEL")
                 .unwrap_or_else(|_| "qwen2.5-coder:1.5b".into()),
+            // Ollama 默认 num_ctx 只有 2048：长简历的指令+文档会被静默截断，
+            // 模型看到的是文档尾部，于是**不按指令输出 JSON**而是直接续写（实测复现）。
+            ollama_num_ctx: std::env::var("OLLAMA_NUM_CTX")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(8192)
+                .clamp(512, 131_072),
             qcc_mcp_base_url: std::env::var("QCC_MCP_BASE_URL")
                 .unwrap_or_else(|_| "https://agent.qcc.com/mcp".into()),
         }
@@ -128,12 +136,49 @@ fn key_usable(key: &str) -> bool {
     !k.is_empty() && !matches!(k.to_lowercase().as_str(), "skip" | "your-deepseek-api-key" | "your-openai-api-key")
 }
 
+/// 单个 provider 的推理超时（秒）。
+///
+/// 原来硬编码 90s：本机 qwen2.5:7b 处理 6 千字文档实测 113s，**还没出结果就被掐断**，
+/// 表现为长简历上传后 `status=partial` / `extracted=null`，很容易被误判成"模型不行"。
+fn llm_timeout_secs() -> u64 {
+    std::env::var("LLM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(10, 900)
+}
+
+/// 送入 LLM 的最大字符数（防呆）。
+///
+/// 100 页 PDF 抽出的文本能让本地 7b 跑到好几分钟，用户会以为 App 卡死。
+/// 所有 prompt 的组装格式都是「指令在前、文档在后」，所以**截尾是安全的**
+/// ——丢的是文档尾部，指令和文档开头都保住了。
+fn llm_max_input_chars() -> usize {
+    std::env::var("LLM_MAX_INPUT_CHARS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(6000)
+        .clamp(500, 200_000)
+}
+
+fn clamp_prompt(prompt: &str) -> String {
+    let max = llm_max_input_chars();
+    let n = prompt.chars().count();
+    if n <= max {
+        return prompt.to_string();
+    }
+    let truncated: String = prompt.chars().take(max).collect();
+    tracing::warn!("LLM 输入 {} 字符，已截断到 {} 字符（LLM_MAX_INPUT_CHARS）", n, max);
+    format!("{truncated}\n…（原文过长，已截取前 {max} 字符）")
+}
+
 /// 按 X1 过滤后的顺序调用。没有任何可用 provider 时返回 None（不回退 DeepSeek）。
 pub async fn call_llm(settings: &Settings, prompt: &str, temperature: f32) -> Option<String> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(llm_timeout_secs()))
         .build()
         .ok()?;
+    let prompt = clamp_prompt(prompt);
     for provider in settings.provider_order() {
         let result = match provider.as_str() {
             "deepseek" if key_usable(&settings.deepseek_api_key) => {
@@ -145,7 +190,7 @@ pub async fn call_llm(settings: &Settings, prompt: &str, temperature: f32) -> Op
                     ),
                     &settings.deepseek_api_key,
                     &settings.deepseek_model,
-                    prompt,
+                    &prompt,
                     temperature,
                 )
                 .await
@@ -159,12 +204,12 @@ pub async fn call_llm(settings: &Settings, prompt: &str, temperature: f32) -> Op
                     ),
                     &settings.openai_api_key,
                     &settings.openai_model,
-                    prompt,
+                    &prompt,
                     temperature,
                 )
                 .await
             }
-            "ollama" => post_ollama(&client, settings, prompt, temperature).await,
+            "ollama" => post_ollama(&client, settings, &prompt, temperature).await,
             _ => None,
         };
         if result.is_some() {
@@ -231,7 +276,7 @@ async fn post_ollama(
             "model": model,
             "prompt": prompt,
             "stream": false,
-            "options": { "temperature": temperature },
+            "options": { "temperature": temperature, "num_ctx": settings.ollama_num_ctx },
         }))
         .send()
         .await

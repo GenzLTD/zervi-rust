@@ -12,12 +12,18 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+mod local_auth;
 mod tatha;
 
 #[derive(Clone)]
 struct AppState {
     http_client: Client,
     service_discovery: Arc<ServiceDiscovery>,
+    /// 本地开发账号体系用的 PG 连接池（懒连接，不阻塞启动）。
+    ///
+    /// 只有 `/v1/auth/register|login|me` 会用到；转发链路（resume/job/...）不依赖它，
+    /// 所以 `DATABASE_URL` 缺失或 PG 未起时网关仍能正常做反向代理。
+    db: Option<sqlx::PgPool>,
 }
 
 /// 构建网关 Router。
@@ -51,6 +57,11 @@ fn app() -> Router {
     let state = AppState {
         http_client,
         service_discovery: Arc::new(ServiceDiscovery::new()),
+        // `connect_lazy` 不发起真实连接 ⇒ 网关不会因为 PG 没起而启动失败
+        db: std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .and_then(|url| sqlx::postgres::PgPool::connect_lazy(&url).ok()),
     };
 
     // 配置 CORS（前端走 Bearer header，不用 cookie ⇒ 无需 allow_credentials）
@@ -79,6 +90,12 @@ fn app() -> Router {
         .route("/v1/ask", post(tatha::ask))
         // 量子认证兼容端点：Tatha 的 QUANTUM_AUTH_URL 指向此处
         .route("/v1/auth/verify", get(tatha::verify))
+
+        // ── 本地开发账号体系（邮箱 + 密码，ZERVI_DEV_AUTH=1 才启用）────────
+        // 生产走 Supabase Auth；这三条仅用于本地让客户端的 Required 级接口可用。
+        .route("/v1/auth/register", post(local_auth::register))
+        .route("/v1/auth/login", post(local_auth::login))
+        .route("/v1/auth/me", get(local_auth::me))
 
         // ── resume-service · /v1/resume/* (7) ───────────────────────────
         .route("/v1/resume/parse", any(route_to_resume_service))
@@ -175,6 +192,10 @@ fn app() -> Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 加载仓库根 .env（不覆盖已存在的环境变量）：
+    // JWT_SECRET / DATABASE_URL 等既被 tatha 鉴权用到，也被本地账号体系用到。
+    let _ = dotenvy::dotenv();
+
     // 初始化日志
     tracing_subscriber::fmt()
         .with_target(false)
@@ -182,6 +203,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("🚀 Starting ADIRP API Gateway...");
+    if matches!(
+        std::env::var("ZERVI_DEV_AUTH").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
+        info!("🔑 本地开发账号体系已启用：/v1/auth/register|login|me（生产请用 Supabase Auth）");
+    }
 
     let app = app();
 
@@ -193,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
     info!("   - /health                    -> Health check");
     info!("   - /v1/ask                    -> tatha (Python brain, gated)");
     info!("   - /v1/auth/verify            -> token introspection for tatha");
+    info!("   - /v1/auth/register|login|me -> local dev auth (ZERVI_DEV_AUTH=1)");
     info!("   - /v1/resume/*          (7)  -> resume-service");
     info!("   - /v1/jobs/*            (9)  -> job-service");
     info!("   - /v1/job-posts*        (5)  -> job-service (双轨 B)");

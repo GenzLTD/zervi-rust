@@ -28,3 +28,12 @@ hex.workspace = true
 common = { path = "../shared/common" }
 consul-client = { path = "../shared/consul-client" }
 
+# 本地开发账号体系（/v1/auth/register|login|me）：直连 genzltd.users
+# 用 sqlx 而非 sea-orm：前者支持 `connect_lazy`（同步构造、不建连），
+# 可让网关在 PG 未启动时照常做转发；queries 走运行时拼接，无需 macros feature。
+sqlx.workspace = true
+bcrypt.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+

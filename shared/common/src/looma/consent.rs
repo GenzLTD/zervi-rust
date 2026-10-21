@@ -34,6 +34,11 @@ pub async fn require_consent(
     principal: &Principal,
     scope: &str,
 ) -> Result<(), Response> {
+    // 本地开发旁路（对齐 looma AUTH_STUB 双轨口径）：
+    // 仅当显式设置 ZERVI_DEV_BYPASS_CONSENT=1 时生效，生产部署绝不设置该变量。
+    if std::env::var("ZERVI_DEV_BYPASS_CONSENT").as_deref() == Ok("1") {
+        return Ok(());
+    }
     let shown = parent(scope).unwrap_or(scope);
     if !has_granted(state, &principal.user_id, scope).await? {
         if let Some(pkg) = parent(scope) {
