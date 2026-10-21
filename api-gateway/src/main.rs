@@ -38,10 +38,23 @@ struct AppState {
 /// 本轮未迁移的 Blueprint（poetry / game / trust / compliance / reports / ...）
 /// 仍在 :5200。
 ///
-/// ⚠️ **payment 已于 2026-10-21 移出本兜底** —— 它此前和上面几个 Blueprint 一样
-/// 写在注释里挂着，但 payment-service 实际已在 :3009 独立运行，只是网关没有
-/// 直通路由 ⇒ 请求走到 fallback 转发到 :5200（那里没有支付实现），
-/// 表现为「服务起来了但经网关访问支付端点永远不通」。已改为显式直通。
+/// ⚠️ **payment 已于 2026-10-21 部分移出本兜底** —— 原先它被列在上面那串
+///「仍在 :5200」里，payment-service 后来已在 :3009 独立运行却没人回头改注释，
+/// 网关迟迟没给直通路由。
+///
+/// **但要特别注意：looma :5200 并非没有支付实现。** 它挂着 `payment_bp`
+///（url_prefix="/v1"）与 `huawei_iap_bp`（url_prefix="/v1/payment/huawei"），
+/// 提供微信 / Stripe / PayPal / Airwallex / 华为 IAP，即 `/v1/payment/*` 在
+/// :5200 **本来就存在**，只是**不含 Apple 分支**。所以：
+///   · 修复前 Apple 三端点落到 :5200 得到的是 **404**（不是"那边没支付"）；
+///   · 本机 looma 未启动时表现为 502 连接失败。
+///
+/// **数据面与 looma 并不互通（跨仓一致性检查，2026-10-21）**：
+/// looma 侧落 **SQLite**（`backend/src/db/manager.py`，`subscriptions` / `users.tier`），
+/// 本仓 payment-service 落 **PostgreSQL**（`iap_subscriptions` / `apple_iap_transactions`
+/// / `users.tier`）。两侧表名与列名同名但不同库 ⇒ Apple 支付成功后写的是 PG，
+/// looma 的 `/v1/payment/status` 读 SQLite，看到的仍是 free。**这是当前最大的
+/// 一致性缺口，收敛方案待定，勿假定两边会自动同步。**
 const LOOMA_LEGACY_PORT: u16 = 5200;
 
 fn app() -> Router {
@@ -171,12 +184,16 @@ fn app() -> Router {
         )
 
         // ── payment-service · /v1/payment/apple/* (3) ───────────────────
-        // Apple IAP（2026-10-21 由 feat/apple-iap 合入主线）。这三个端点由
-        // payment-service 在 :3009 提供，此前网关**没有直通路由**，请求会落到
-        // fallback → looma :5200（那里没有支付实现）⇒ 客户端经网关永远调不通，
-        // 只能直连 :3009。上架审核要走通收据校验，故此处补齐。
+        // Apple IAP（2026-10-21 由 feat/apple-iap 合入主线）→ payment-service :3009。
         //
-        // 转发遵循 D2 口径保留完整 path+query，因此网关对外路径与 payment-service
+        // ⚠️ **`/v1/payment/` 前缀现在是分裂的，勿假定同源**：
+        //   · `/v1/payment/apple/*`  → 本仓 payment-service :3009（PostgreSQL）
+        //   · `/v1/payment/*` 其余   → fallback looma :5200（SQLite，微信/Stripe/
+        //                              PayPal/Airwallex/华为 IAP，**不含 Apple**）
+        // 两侧数据不互通，Apple 支付成功后写 PG，looma 的 status 查 SQLite 仍为 free。
+        // 详见文件顶部 `LOOMA_LEGACY_PORT` 处的说明。
+        //
+        // 转发遵循 D2 口径保留完整 path+query，故网关对外路径与 payment-service
         // 内部路由逐字相同（/v1/payment/apple/verify 等）。
         // Apple 的 webhook 由 App Store 服务器回调，无网关鉴权头 —— 鉴权在
         // payment-service 内部按 Apple 签名校验收口（与网关「不在网关裁决」口径一致）。
