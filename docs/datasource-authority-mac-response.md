@@ -4,6 +4,21 @@
 > 回应对象：`review_credibility_verify.md` 中"需要 Mac 侧澄清的 4 件事"
 > 产出方式：全部为本地实测，未依赖先前结论
 
+## 提交钉珠（Source of truth）
+
+跨仓互钉，任一分支被删除后仍可追溯到内容：
+
+| 方向 | 仓 @ 分支 | 钉住的 SHA | 内容 |
+|---|---|---|---|
+| 对侧（脚本侧） | `looma-zervi` @ `ops/pg-export-safe-default` | **`46ae918`** | 导出脚本：默认不清表 + `source_sanity()` 源库身份自检 |
+| 本侧（文档侧） | `zervi-rust` @ `docs/datasource-authority-round3` | `7592ff8`（pre-pin） | Round 3 全文（不含本节） |
+| 本侧 tip | 同上分支 | `7592ff8` 的子提交 | 本文档当前版本 |
+
+自引用不写入正文（否则需要先知道自己 SHA，会自相矛盾）；**当前 tip 以分支头为准**，
+引用本文档时请写分支 tip，`7592ff8` 保留为 pre-pin 引用。
+两个仓的合并**必须用 merge commit，不得 squash** —— squash 会把这两颗钉子改写成新提交，
+让本表与所有交叉引用一并失效。
+
 ## 结论先行
 
 四问全部有答案，且**其中一项要修正我上一轮的评审结论**。更重要的是第 ② 项的实测结果
