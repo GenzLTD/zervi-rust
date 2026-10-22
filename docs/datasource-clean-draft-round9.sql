@@ -14,8 +14,15 @@
 --   ⇒ 合并语义收缩为：清旧 + 只留账号 + 入 zervi（含其 2 条 orders）。
 --   poems / columns / driver_profiles 一行不写（沿用拍板第 3 条）。
 --
--- 本机 staging 实测（public = 10-22 转储还原，sg = SG 快照导入）：
---   删除 120 行；users 10 → 7（6 共同 + zervi）；11 张业务表归零；
+-- Win 2026-10-22 收尾拍板（本文件随后补上，尚未在 55432 重跑全流程）：
+--   ① poems 闸门保持 strict。执行必须显式 -v poems_gate=allow_created_at_skew。
+--      本机已核对 58,059 行差异只在 created_at，业务列无差异；开关不改默认值。
+--   ② PG 剩下的 6 家也删：4×测试用户-免费版、1×测试用户-支持者、1×演示科技。
+--      enterprises 期望从 6 改为 0。相对上一轮 staging 清单再减 6 行：
+--      58,392 → 58,133，净 -259。
+--
+-- 上一轮 staging 实测（public = 10-22 转储还原，sg = SG 快照导入，未含这 6 家）：
+--   删除 255 行、插入 2 行；58,392 → 58,139；users 10 → 7；
 --   enterprises 13 → 6；challenge_rounds 3 → 2；poems 58,059 未动。
 --
 -- 全程单事务，末尾 commit 注释掉（执行者确认后自行提交）。
@@ -264,13 +271,25 @@ delete from public.challenge_rounds where week_key = '2026-W36';
 
 -- =============================================================================
 \echo '==================================================================='
-\echo ' 步骤 3 · enterprises「闭环测试企业」13 条全删（PG 7 删 + SG 6 不并）'
+\echo ' 步骤 3 · enterprises 测试残留全删'
 \echo '==================================================================='
+-- 闭环测试企业：PG 7 删 + SG 6 不并入。
+-- 其余 6 家 PG 原有非闭环也删（Win 2026-10-22 收尾）：
+--   测试用户-免费版 ×4、测试用户-支持者 ×1、演示科技 ×1。
 -- =============================================================================
 
-delete from public.enterprise_users where enterprise_id in (select id from public.enterprises where name = '闭环测试企业');
-delete from public.candidates       where enterprise_id in (select id from public.enterprises where name = '闭环测试企业');
-delete from public.enterprises      where name = '闭环测试企业';
+delete from public.enterprise_users
+ where enterprise_id in (
+   select id from public.enterprises
+    where name in ('闭环测试企业', '测试用户-免费版', '测试用户-支持者', '演示科技')
+ );
+delete from public.candidates
+ where enterprise_id in (
+   select id from public.enterprises
+    where name in ('闭环测试企业', '测试用户-免费版', '测试用户-支持者', '演示科技')
+ );
+delete from public.enterprises
+ where name in ('闭环测试企业', '测试用户-免费版', '测试用户-支持者', '演示科技');
 
 -- =============================================================================
 \echo '==================================================================='
@@ -356,8 +375,8 @@ declare
     "consents":0,"quota_records":0,"game_profiles":0,"mission_completions":0,
     "fleets":0,"fleet_members":0,"enterprise_users":0,"candidates":0,"match_reports":0,
     "narrative_sessions":0,"narrative_events":0,"act1_sessions":0,
-    "domain_visits":0,"value_imprints":0,"micro_feedback":0,
-    "enterprises":6,"challenge_rounds":2,"documents":30,"poems":58059,
+    "domain_visits":0,"value_imprints":0,
+    "enterprises":0,"challenge_rounds":2,"documents":30,"poems":58059,
     "columns":1,"driver_profiles":1,"orders":2,
     "product_events":5,"query_logs":0,"micro_feedback":1,"audit_logs":25
   }';

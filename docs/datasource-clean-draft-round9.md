@@ -25,7 +25,7 @@ Round 8 是合并语义（SG 行经 `merge_map` 改写后并入 PG）。本轮 W
 | beta 4 人的 `updated_at` | 是否采纳 SG 较晚值 | **账号本身删除**，连同全部数据 |
 | `challenge_rounds` 2026-W36 | PG 侧保留、SG 侧跳过（净 8） | **两侧都删**（净 2） |
 | `timeline_events` 去重口径 | 87 / 80 / 68 三选一 | **争议组整组删除**，不再选口径 |
-| `enterprises` 闭环测试企业 | 留一条（净 10） | **13 条全删**（PG 7 删 + SG 6 不并，净 6） |
+| `enterprises` 闭环测试企业 | 留一条（净 10） | **13 条全删**；收尾再删 PG 其余 6 家测试/演示企业，**净 0** |
 
 追加两问（Win 2026-10-22 现场拍板）：
 
@@ -102,9 +102,12 @@ constraint "fk_act1_sessions_session_id" on table "act1_sessions"
 
 ---
 
-## 3. 清理前后全表清单（staging 实测，事务未提交）
+## 3. 清理前后全表清单
 
-**58,392 → 58,139，净 -253 行**（删除 255 行，插入 2 行）。
+表内除 `enterprises` 的「后」已按收尾拍板从实测 6 改为期望 0 之外，其余格子仍是上一轮 staging 的实测值。
+
+上一轮 staging（尚未删那 6 家）：**58,392 → 58,139，净 -253 行**（删除 255 行，插入 2 行）。
+收尾把 6 家测试/演示企业也删掉之后，期望再减 6 行：**58,392 → 58,133，净 -259**。这一步只在本机 10-20 副本上用事务回滚核对过删除本身，没有重跑 55432 全流程。
 
 | 表 | 前 | 后 | 差 |
 |---|---:|---:|---:|
@@ -119,7 +122,7 @@ constraint "fk_act1_sessions_session_id" on table "act1_sessions"
 | `narrative_sessions` | 14 | 0 | -14 |
 | `query_logs` | 13 | 0 | -13 |
 | `audit_logs` | 37 | 25 | -12 |
-| `enterprises` | 13 | 6 | -7 |
+| `enterprises` | 13 | 0 | -13 |
 | `enterprise_users` | 5 | 0 | -5 |
 | `mission_completions` | 5 | 0 | -5 |
 | `quota_records` | 4 | 0 | -4 |
@@ -135,7 +138,7 @@ constraint "fk_act1_sessions_session_id" on table "act1_sessions"
 
 **一行未动**：`poems` 58,059、`documents` 30、`columns` 1、`driver_profiles` 1，
 以及 Round 7 认定的 25 张主键 md5 相同表中的其余表。
-保留下来的 6 个 enterprises 是 PG 侧原有的非闭环企业（SG 侧 12 条 E2E/调试残留与 6 条闭环都没有并入）。
+PG 上闭环之外的 6 家名称是 4×「测试用户-免费版」、1×「测试用户-支持者」、1×「演示科技」。Win 收尾拍板：这 6 家也删，企业侧归零。SG 侧 12 条 E2E/调试残留与 6 条闭环仍不并入。
 
 **users 7 = 6 个共同 UUID + zervi@genz.ltd**（`aac7a4fc-2d9e-45fc-af87-65e31da76f21`，
 带 SG 的 `password_hash` 整行插入，其 2 条 orders 随行）。
@@ -158,9 +161,8 @@ constraint "fk_act1_sessions_session_id" on table "act1_sessions"
 ## 5. 本轮未做 / 待确认
 
 1. **未对生产库执行任何写入**。
-2. **poems 闸门仍需你显式放行**：Round 8 遗留的第 1 项你没有覆盖，本轮也没松闸。
-   不加 `-v poems_gate=allow_created_at_skew` 就在 G1 STOP —— 且 CLEAN 模式下 poems 一行不写。
+2. **poems 闸门保持 strict，执行时必须显式放行。** Win 2026-10-22 收尾确认：不加 `-v poems_gate=allow_created_at_skew` 就在 G1 STOP。本机已核对 58,059 行差异只在 `created_at`，业务列无差异。CLEAN 模式不写 `poems`，开关只确认源数据仍是这份，不改脚本默认值。
 3. **zervi 在 SG 侧的 `product_events` 3 行不随行**（Round 8 拍板只带 2 条 orders）。
    要带的话解开脚本里那段注释即可。
-4. **保留的 6 家 PG 企业没清理**：它们不在四项争议里。如果"干净联调"要求企业侧也归零，说一声，加一条 delete 即可。
+4. **6 家测试/演示企业已纳入步骤 3 的删除名单**，G3 期望 `enterprises = 0`。全流程尚未在 55432 上重跑。
 5. **`micro_feedback` 剩下的 1 行属于 guest 伪 ID**（`guest-28ad1ce4-814`，不在 users 表），未删。
