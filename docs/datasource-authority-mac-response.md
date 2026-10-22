@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 对侧（脚本侧） | `looma-zervi` @ `ops/pg-export-safe-default` | **`46ae918`** | 导出脚本：默认不清表 + `source_sanity()` 源库身份自检 |
 | 本侧（文档侧） | `zervi-rust` @ `docs/datasource-authority-round3` | `7592ff8`（pre-pin） | Round 3 全文（不含本节） |
-| 本侧 tip | 同上分支 | `73277cb` 的子提交 | 本文档当前版本（含 Round 4–6） |
+| 本侧 tip | 同上分支 | `73277cb` 的子提交 | 本文档当前版本（含 Round 4–7） |
 
 自引用不写入正文（否则需要先知道自己 SHA，会自相矛盾）；**当前 tip 以分支头为准**，
 引用本文档时请写分支 tip，`7592ff8` 保留为 pre-pin 引用。
@@ -625,3 +625,224 @@ sha256 = 8c50e17db07a78574bcb7faeec5f3c5e8d7fd28378a82bfc9eafee138fa40aba   (7,8
 1. **字段级比对**：主键相同的行（如 `documents` 的 30 行、`users` 的 6 行）内容是否一致，未比。
 2. **外键引用完整性**：UUID 重映射会牵动外键，未做影响面清单。
 3. 未执行任何写入；目标机仅临时落过 `pg_dump`/两个 SQL，均已删除。
+
+---
+
+# Round 7 · 验收交付：转储指纹 + 55 表 md5 + 三张拍板表 + 目标库复核（2026-10-22 10:0x GMT+8）
+
+> 回应 Win 侧「单源合并开工验收清单」四项。全部实测；**未对腾讯云 genzltd 执行任何 apply**，
+> 未 `--recreate`，未把 10-20 转储导回。
+
+## ① 10-22 PG 转储（Win 要求核对的文件）
+
+```
+文件   : snapshots/genzltd-20261022.sql.gz
+大小   : 7,804,995 字节
+sha256 : 8c50e17db07a78574bcb7faeec5f3c5e8d7fd28378a82bfc9eafee138fa40aba
+```
+
+与 Win 侧给出的目标指纹**逐字符一致** ✅。该文件由目标机容器内
+`pg_dump -U looma -d genzltd | gzip` 生成，两端 sha256 对拍一致后落盘，目标机 `/tmp` 已清理。
+SG 快照 `6b08bdae…9b509` Win 已自行核对，本轮不再重复。
+
+## ② 55 张表主键 md5（同口径，Win 可重算）
+
+**口径（两侧完全一致）**
+
+- 主键列：两侧 `information_schema` / `PRAGMA table_info` 各自取，**已逐表核对，55 张表的
+  主键列集合与顺序全部一致**（含 `signal_ingest` 三列 `signal_type,user_email_hash,nonce`、
+  `value_imprints→user_id`、`act1_sessions→session_id`）。无一张表缺主键。
+- 表达式（PG 侧）：
+
+  ```sql
+  select '<table>' as t, count(*)::text as n,
+         md5(coalesce(string_agg(<key>, ',' order by <key>),'')) as m
+  from public."<table>";
+  -- <key> = coalesce("c1"::text,'') || '/' || coalesce("c2"::text,'') || …
+  ```
+
+- SG 侧同法：各列 `str(v)`（NULL→`''`），行内 `/` 连接，**按文本序排序**后 `,` 连接取 md5。
+- 空表约定：`string_agg` 为空 → `md5('') = d41d8cd98f00b204e9800998ecf8427e`（两侧同）。
+
+**汇总**
+
+| | 张数 |
+|---|---:|
+| 主键集合（md5）相同 | **25** |
+| 不同 | **30** |
+| — 其中两侧都有行且交集为 0（真·整表互斥） | **14** |
+| — 其中 SG 空 / PG 有行 | **6** |
+| — 其中 PG 空 / SG 有行 | **6** |
+| — 其中两侧有交集 | **4** |
+
+Win 指出的修正成立：上轮摘要写的「整表互斥 20」把「一侧为空」也算进去了；
+正确拆分是 **14 + 6 + 6 + 4 = 30** ✅。
+
+差异表并集账：仅 SG **587** + 仅 PG **290** + 交集 **41** = **918** 行。
+| # | 表 | 主键列 | SG 行 | PG 行 | SG md5 | PG md5 | 相同 |
+|---:|---|---|---:|---:|---|---|---|
+| 1 | `act1_sessions` | `session_id` | 0 | 14 | `d41d8cd98f00b204e9800998ecf8427e` | `d83ba13d9f95916cef8b3fafe78d693f` | ❌ |
+| 2 | `applications` | `id` | 9 | 23 | `9bd29f389533cddffdf795387e532c55` | `e0fa4d25e5ddd9fab43c474cb2267510` | ❌ |
+| 3 | `articles` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 4 | `audit_logs` | `id` | 225 | 37 | `4ec4b23f0d27ae3649be823509ba93f2` | `f0e0f29847e019ab811bf35ab29f5878` | ❌ |
+| 5 | `boost_consumptions` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 6 | `boost_packs` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 7 | `candidates` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 8 | `challenge_entries` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 9 | `challenge_rounds` | `id` | 6 | 3 | `dd1efb333b1213899ac525d09b54be9f` | `55b84a9d317184fe61224bfb4a060fb0` | ❌ |
+| 10 | `chunks` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 11 | `columns` | `id` | 1 | 1 | `ed311d647223b8110ab6046aee5df2cf` | `ed311d647223b8110ab6046aee5df2cf` | ✅ |
+| 12 | `consents` | `id` | 27 | 14 | `e836b4e6ae6ef68270bbdf9c695e1f51` | `b15042c8c02a0fc23c16537b8f77a04f` | ❌ |
+| 13 | `documents` | `id` | 39 | 30 | `9c395ce126ceaad37636aaec856b001d` | `f29c6023e808b041b06c5ba374f40052` | ❌ |
+| 14 | `domain_visits` | `id` | 0 | 14 | `d41d8cd98f00b204e9800998ecf8427e` | `9260a1b366f0243bd9bdb547b2738a02` | ❌ |
+| 15 | `driver_profiles` | `id` | 1 | 1 | `582ff7f4bbbb067d8349c7018fce4bd8` | `582ff7f4bbbb067d8349c7018fce4bd8` | ✅ |
+| 16 | `emergent_strategy_log` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 17 | `enterprise_users` | `id` | 2 | 5 | `cbe90db0602359b8460be76db2bb48e4` | `2b9693b987931acf515b2447b390a2ec` | ❌ |
+| 18 | `enterprises` | `id` | 21 | 13 | `067064f101d46fd85ceae363cba8211c` | `471d8be4b4ecda5cf2283e8bdec5a5d2` | ❌ |
+| 19 | `fleet_members` | `id` | 4 | 2 | `d3158d99e54e7c239c676e5795d22899` | `15291fea93e972684f010ad5a0b5aba7` | ❌ |
+| 20 | `fleets` | `id` | 4 | 2 | `43354584ea9785c866adccd30036723c` | `1e2c2053c8c7f40549dffbca30bfb906` | ❌ |
+| 21 | `game_profiles` | `id` | 7 | 3 | `f790e11459b310ee82fd9c3302975129` | `a71c7e071fca144b44fb6b1f79d5e002` | ❌ |
+| 22 | `huawei_push_tokens` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 23 | `invite_codes` | `id` | 3 | 0 | `14107032b5a3ec93e9cd244009e40d36` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+| 24 | `job_posts` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 25 | `llm_usage` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 26 | `match_consensus` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 27 | `match_report_items` | `id` | 11 | 0 | `44a020cb03668869e2bb6682e406131f` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+| 28 | `match_reports` | `id` | 11 | 0 | `d3f89db0b8bd2f573678177b7a1c4fd4` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+| 29 | `micro_feedback` | `id` | 0 | 2 | `d41d8cd98f00b204e9800998ecf8427e` | `05cf281c050be3da4eecf3bc6e8aac1b` | ❌ |
+| 30 | `mission_completions` | `id` | 8 | 5 | `cd0ee72c2286fae0eb16dc193627a9a5` | `8f290ea23d3533403756d60424ff8eec` | ❌ |
+| 31 | `narrative_events` | `id` | 0 | 43 | `d41d8cd98f00b204e9800998ecf8427e` | `e5e19a7305e52c8808bc82afc720a6ae` | ❌ |
+| 32 | `narrative_feedback` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 33 | `narrative_sessions` | `id` | 0 | 14 | `d41d8cd98f00b204e9800998ecf8427e` | `d83ba13d9f95916cef8b3fafe78d693f` | ❌ |
+| 34 | `navigator_memories` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 35 | `orders` | `id` | 2 | 0 | `db615af1a12b0aaf5aa00002bd3935da` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+| 36 | `poems` | `id` | 58059 | 58059 | `faa6c4748a197fd244b1ccd20cf57608` | `faa6c4748a197fd244b1ccd20cf57608` | ✅ |
+| 37 | `product_events` | `id` | 25 | 28 | `aa1b436cc811fcce7b6f3fa173bca009` | `734906c86ff89a84deaeb0b4768b1de2` | ❌ |
+| 38 | `query_logs` | `id` | 69 | 13 | `c7f0aafaaa87b564ffdc80d651c6fe95` | `ae3aea173874e102014b01ec608f261f` | ❌ |
+| 39 | `quiz_sessions` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 40 | `quota_records` | `id` | 29 | 4 | `196d0eeab6cae2c31f4f8844474b4ce0` | `f3dd8bda0dc04d022d4b69b245b7768e` | ❌ |
+| 41 | `report_sharing` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 42 | `sales_inquiries` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 43 | `share_codes` | `id` | 4 | 0 | `ec8d2dfb5205a27de3f2c69da9ccac6a` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+| 44 | `signal_dlq` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 45 | `signal_ingest` | `signal_type,user_email_hash,nonce` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 46 | `signal_outbox` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 47 | `subscriptions` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 48 | `timeline_events` | `id` | 68 | 19 | `11938b3429e900572ccbf4a9f37f0986` | `2761462a50f81239f72939c5baccae91` | ❌ |
+| 49 | `trust_attestations` | `id` | 8 | 3 | `54a7be32f2e50cb3481dd6527f6860d9` | `0ef48fa2e9c4d80c1f8e1b5810864d23` | ❌ |
+| 50 | `trust_memories` | `id` | 29 | 28 | `31b7af138dcd468ba00019a04e5115af` | `495c224650762a2f29085304e0a8cb23` | ❌ |
+| 51 | `usage_logs` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 52 | `user_identities` | `id` | 0 | 0 | `d41d8cd98f00b204e9800998ecf8427e` | `d41d8cd98f00b204e9800998ecf8427e` | ✅ |
+| 53 | `users` | `id` | 11 | 10 | `51befc0721dba6ca6548b24ed308df46` | `4cb7bd9b400b28ab7f49b2fa385efdcf` | ❌ |
+| 54 | `value_imprints` | `user_id` | 0 | 2 | `d41d8cd98f00b204e9800998ecf8427e` | `7c8d9a4747f7f5d588817405ad5ec3b0` | ❌ |
+| 55 | `verification_audit_log` | `id` | 6 | 0 | `33c2ae3bff8e9d3edf673eda81db390e` | `d41d8cd98f00b204e9800998ecf8427e` | ❌ |
+
+---
+
+## ③ 三张拍板表（只给结论，未写生产库）
+
+### 3.1 `users` —— 11 个 email 各留哪一侧 UUID
+
+**保留规则（R1–R3，建议，待 Win 拍板）**
+
+- **R1 业务唯一键 = email**，不是 UUID。11 个 email = 11 个人（按 UUID 并集会得出 15，错误）。
+- **R2 两边都有时，保留 PG（境内）侧 UUID**。理由：目标库就是 genzltd，
+  其现有 `applications` 23 条、`documents` 30 条、`consents` 14 条、`timeline_events` 19 条
+  已在引用 PG UUID；保留 PG 侧 ⇒ **现有引用零回写**，改动面最小。
+- **R3 仅一侧有 → 保留该侧**。SG 独有的 `zervi@genz.ltd` 保留 SG UUID 并新插入 PG
+  （它在 SG 有 2 条 `orders` 引用，必须随行插入，否则订单变孤儿）。
+
+| # | email | SG UUID | PG UUID | 保留（建议） | 丢弃 |
+|---:|---|---|---|---|---|
+| 1 | `beta_free@looma.test` | `18ece1d7-90f9-464f-80b7-36442ff1b617` | `3eeff409-4272-49a3-b064-4f11aa11576e` | **PG** `3eeff409…` | SG `18ece1d7…` |
+| 2 | `beta_supporter@looma.test` | `9d171561-d154-46b3-b375-c25e95231d4a` | `e54e21c7-9216-42bb-8092-34e56a23f889` | **PG** `e54e21c7…` | SG `9d171561…` |
+| 3 | `beta_pro@looma.test` | `0be2b853-3f7c-46a6-89f1-126a6108e281` | `17b51b4d-a951-4488-a664-b3a5c25bfd73` | **PG** `17b51b4d…` | SG `0be2b853…` |
+| 4 | `beta_admin@looma.test` | `9560bc34-03d1-4b0a-9e09-5fb152348c0e` | `fcf2c1fc-ada1-4182-9587-dc4b65bc3764` | **PG** `fcf2c1fc…` | SG `9560bc34…` |
+| 5 | `reed.xia@gmail.com` | `1b52a63b-fd8d-49d4-b059-bf8ad5512eee` | 同左 ✅ | SG=PG | — |
+| 6 | `wcy0811@sjtu.edu.cn` | `65674880-dd6f-457a-9748-d68f4cdfa1b4` | 同左 ✅ | SG=PG | — |
+| 7 | `596099829@qq.com` | `1797374a-73d1-46a8-8c6a-dac5e9ebd020` | 同左 ✅ | SG=PG | — |
+| 8 | `347399@qq.com` | `5357e927-6085-4441-a15b-3560c62af114` | 同左 ✅ | SG=PG | — |
+| 9 | `szbenyx@163.com` | `2d53f88e-4dbb-47d1-93c7-87e7087af321` | 同左 ✅ | SG=PG | — |
+| 10 | `official@szbolent.com.cn` | `driver-official` | 同左 ✅ | SG=PG | — |
+| 11 | `zervi@genz.ltd` | `aac7a4fc-2d9e-45fc-af87-65e31da76f21` | —（PG 无） | **SG** `aac7a4fc…`（新插入） | — |
+
+⇒ 合并后 **11 人**；丢弃 4 个 UUID（第 1–4 行的 SG 侧）。
+
+### 被丢弃的 4 个 UUID：出现在哪些外键表、多少行
+
+口径：两侧 40 个 `REFERENCES users` 的列全查。**PG 侧引用数 = 0**（SG UUID 从未进过 PG，已实测验证），
+所以下面的行数是 **SG 侧需要回写 UUID 的行**：
+
+| 被丢弃 UUID（email） | 引用行数 | 分布 |
+|---|---:|---|
+| `18ece1d7-90f9-464f-80b7-36442ff1b617`（beta_free） | **20** | consents 1 · fleet_members 1 · fleets.captain_id 1 · game_profiles 1 · invite_codes.created_by 1 · mission_completions 1 · quota_records 3 · timeline_events 5 · trust_attestations 2 · trust_memories 4 |
+| `9d171561-d154-46b3-b375-c25e95231d4a`（beta_supporter） | **0** | 无任何外键引用（可直接丢弃） |
+| `0be2b853-3f7c-46a6-89f1-126a6108e281`（beta_pro） | **39** | consents 9 · enterprise_users 1 · fleet_members 1 · fleets.captain_id 1 · game_profiles 1 · invite_codes.created_by 1 · match_reports 1 · mission_completions 2 · quota_records 7 · share_codes.owner_id 2 · trust_attestations 2 · trust_memories 9 · verification_audit_log.owner_id 2 |
+| `9560bc34-03d1-4b0a-9e09-5fb152348c0e`（beta_admin） | **81** | applications.seeker_user_id 9 · consents 7 · enterprise_users 1 · fleet_members 1 · fleets.captain_id 1 · game_profiles 1 · match_reports 9 · quota_records 9 · timeline_events 36 · trust_attestations 2 · trust_memories 5 |
+| **合计** | **140** | 涉及 15 张表的 15 个外键列 |
+
+另：SG 独有 `zervi@genz.ltd`（`aac7a4fc…`）在 SG 有 **2 行** `orders.user_id` 引用
+（`b935165e…`、`6040c3eb…`）—— 插入用户时必须同批插入，否则订单成孤儿。
+
+### 3.2 14 张真·整表互斥表：逐表结论
+
+判定前先做了 **UUID 规范化**（把两边 user_id 映射到同一 canonical 身份）再比业务键——
+结果是：**14 张里有 11 张存在业务键冲突，"整表互斥所以直接 union" 是错的。**
+
+| 表 | SG/PG | 结论 | 依据（实测） |
+|---|---|---|---|
+| `applications` | 9/23 | **并集 + 按 (seeker_user_id, job_id) 去重 1 条** | 完整业务键是 (seeker, job_id)，交集 1：`beta_admin`+`job j1`，两边同为 `withdrawn`（SG 08-08 21:34 / PG 20:25）→ 留 1 条。(seeker, resume_id) 的 8 条"冲突"是**伪冲突**：同一份简历投不同岗位（SG job=j1，PG job=j2–j5）→ 保留。净 31 条 |
+| `audit_logs` | 225/37 | **并集，无去重** | append-only 审计；UUID 主键；(actor, action, resource_id) 交集 **0** → 262 条 |
+| `consents` | 27/14 | **并集 + 按 (user, scope) 取最新，不能一刀切** | 交集 9 组且**方向不一致**：beta_admin 的 job_match/jobseeker_core/report_generate/resume_parse/resume_upload 在 SG 是 granted(08-08 13:33)、PG 是 revoked(08-08 06:48) → SG 晚 6.75h 胜出；而 beta_free 的 ask_rag 是 SG 07-15 / PG 07-26 → PG 晚 19 天胜出。**必须逐行按 granted_at/revoked_at 取最新**。净 32 条 |
+| `enterprise_users` | 2/5 | **并集** | UUID 主键；(user_id, role) 交集 0、(enterprise_id, user_id) 交集 0 → 7 条。但若 `enterprises` 去重合并，enterprise_id 需同步回写 |
+| `enterprises` | 21/13 | **并集 + 按 name 去重 1 条；另建议 13 条不纳入** | name 交集 1：`闭环测试企业`。SG 侧 13 条名为 `Overseas Browser <毫秒时间戳>` / `Overseas E2E <毫秒时间戳>` / `DebugCo` / `DebugCo2`，是 E2E 与调试残留 → **建议不纳入单源**，其余并入。净 20 条（若剔除测试残留） |
+| `fleet_members` | 4/2 | **并集** | UUID 主键，主键与 (fleet_id, user_id) 均交集 0 → 6 条 |
+| `fleets` | 4/2 | **并集** | UUID 主键；name 交集 0、invite_code 交集 0 → 6 条 |
+| `game_profiles` | 7/3 | **按 user_id 取 updated_at 最新，不 union** | user_id 交集 2 且**方向不一致**：beta_free SG 07-23(xp50/captain) vs PG 07-07(xp50/null) → 取 SG；beta_admin SG 07-25(xp0/explorer) vs PG 08-17(xp170/captain) → 取 PG。净 8 条 |
+| `mission_completions` | 8/5 | **并集 + 去重 1 条** | (user, mission_id) 交集 1：beta_free/personality，SG 07-23 vs PG 07-07，xp 同为 50 → 留较晚的 SG 一条。净 12 条 |
+| `query_logs` | 69/13 | **并集（重编主键）** | 自增整数主键有伪交集风险；(query_text, created_at) 交集 0；仅 query_text="你好" 两边各现一次且时间不同 → 均保留。净 82 条 |
+| `quota_records` | 29/4 | **并集** | (user, resource, **date**) 交集 **0**，日期互不重叠 → 33 条。(user, resource) 的 4 组重叠是不同日期的正常配额，不是冲突 |
+| `timeline_events` | 68/19 | **并集 + 按 (user, title) 去重 7 条** | (user, event_kind, occurred_at) 交集 0，但 (user, title) 交集 **7**：如 beta_free「完成职业画像初测」SG 10-14 / PG 08-19，「起始画像」SG 10-14 / PG 08-19 → 同一事件两侧各记一次，按 title 去重取 occurred_at 最新。净 80 条 |
+| `trust_attestations` | 8/3 | **并集 + 冲突 3 条按置信度取高** | (candidate, claim_type) 交集 3：collaboration 两条两边完全相同(verified/0.9) → 去重；identity 一条 SG weak/0.45 vs PG verified/0.93 → 取 PG。净 8 条 |
+| `trust_memories` | 29/28 | **并集 + 同内容去重** | memory_content 交集 1（同一份「星云艺术家」画像 JSON）：SG 5 行(07-23/07-27)、PG 2 行(08-17) → 按 (user, session_type, memory_content) 去重保留最新。(user, session_type) 的 4 组重叠是同一人多次 quiz，属正常 → 保留。净 ≤56 条 |
+
+### 3.3 4 张有交集的表：同主键字段是否一致
+
+**⚠️ 决定性发现：这 4 张里 3 张是「伪交集」——主键是自增整数，两边各行自增，
+撞号不代表同一条业务数据。**
+
+| 表 | 共同主键 | 全字段相同 | 差异列 | 结论与取舍 |
+|---|---:|---:|---|---|
+| `documents` | 30 | **0 行** | title 30 · file_path 30 · file_size 30 · metadata 30 · created_at 30 · doc_type 17 · status 15 | **伪交集**：SG id=1 是「简历.docx」(job/12874B)，PG id=1 是「cloud_interop_test.md」(resume/108B)，30 行无一相同。**不存在字段取舍问题（不是同一文档）→ 重编主键后并集 39+30=69 条**。若按主键覆盖会丢掉 SG 全部 39 条文档 |
+| `users` | 6（原始 UUID） | 1 行 | password_hash 4 · created_at 5 · updated_at 5 | **唯一真交集**。共同 UUID 的 6 人中 5 人有差异，**差异只在这 3 列**：<br>• `password_hash`：4 个 beta 的 bcrypt 两边不同 → **建议保留 PG 侧**（与 R2 一致），后果是这 4 个账号合并后用**境内口令**登录，SG 侧口令作废<br>• `created_at`：beta 4 人 SG 07-15 / PG 07-06；driver-official SG 09-25 02:30 / PG 09-24 23:40 → **建议保留 PG**<br>• `updated_at`：建议取两边较晚值 |
+| `product_events` | 2 | **0 行** | event_name 2 · user_id 2 · platform 2 · properties_json 2 · created_at 2 · session_id 1 · source 1 · share_code 1 · success 1 | **伪交集**：id=47 SG 是 `quiz_complete`(tspace_web)，PG 是 `trial_clicked`(planetx_web)；id=48 SG `quiz_complete`，PG `profile_view_failed`(success=0)。**重编主键后并集 25+28=53 条** |
+| `challenge_rounds` | 3 | **0 行** | week_key 3 · poem_id 3 · title 3 · starts_at 3 · ends_at 3 · created_at 3 · status 1 | **伪交集**：id=1 SG 是 2026-W29《江行無題一百首 十六》，PG 是 2026-W36《輞川集二十首 斤竹嶺》。**业务键是 week_key**（两边 W29–31 / W36–39 无重叠）→ 按 week_key 并集 6+3=9 条 |
+
+**⇒ 上轮「4 张有交集」的措辞要改口径：只有 `users` 是真交集；其余 3 张应归入
+「自增整数主键伪交集」，处理方式不是"字段取舍"，而是"重编主键后并集"。**
+
+## ④ 腾讯云只读复核（2026-10-22 10:1x GMT+8）
+
+登录方式（本机 `looma-key.pem`，用户 `ubuntu`）：
+`ssh -i ~/.ssh/looma-key.pem ubuntu@1.14.202.161` —— **只读**，未 `--recreate`，未导入 10-20 转储。
+
+| 检查项 | 10-22 转储时 | 现在（复核） | 结论 |
+|---|---:|---:|---|
+| `poems` | 58,059 | **58,059** | 一致 ✅ |
+| `users` | 10 | **10** | 一致 ✅ |
+| `iap_subscriptions` | 0 行 | **0 行**，表仍存在 | 一致 ✅ |
+| `apple_iap_transactions` | 0 行 | **0 行**，表仍存在 | 一致 ✅ |
+| 对象数 | 59 表 + 1 视图 | **59 表 + 1 视图** | 一致 ✅ |
+| 容器 | — | `looma-pgvector` Up 11 days (healthy) | 正常 ✅ |
+
+⇒ **genzltd 自 10-22 转储以来未被改动**，那份转储仍是当前库的有效快照。
+**IAP 两张表（`iap_subscriptions`、`apple_iap_transactions`）与租户两张
+（`tenants`、`tenant_shelf_items`）都还在** —— 把 10-20 转储导回去确实会碰掉它们，本轮没有这么做。
+
+## 本轮未做 / 待 Win 拍板
+
+1. **未写生产库**：全程只有 `SELECT` / `pg_dump` / `count(*)`；目标机临时文件（md5 SQL、键导出、表导出）均已删除。
+2. 未生成合并 SQL 草案——等 Win 对上面 3.1 的保留规则、3.2 的逐表结论、3.3 的取舍拍板后再写。
+3. `enterprises` 的 13 条 E2E 测试残留是否剔除，需 Win 确认。
+4. `users` 的 `password_hash` / `created_at` 取舍需 Win 确认（我建议全取 PG 侧）。
+5. 字段级比对只做了 4 张有交集的表；25 张 md5 相同的表默认内容一致（md5 只覆盖主键，未逐字段比）—— 若需要可补跑。
