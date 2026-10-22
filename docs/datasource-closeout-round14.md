@@ -8,14 +8,16 @@
 
 单源迁移不能收口。本机做完了自己能做的那一步：把 `docs/single_source_authority_lockdown.md` 第 3 项改成「没有超集就停」，并写明禁止 `--recreate`。第 6 项写明必留的是表，Mac 上的现有行不导入。
 
-下面两道门本机关不上，预发装库因此也不执行：
+新加坡活动库和腾讯云 `genzltd` 保持不写。这两处要等法兰克福预发演练成功之后才可信。
 
 | 门 | 本机结果 |
 |---|---|
-| 法兰克福 `45.76.84.90` 可丢弃且已备份 | 未关。`~/.ssh/config` 没有这台机器。用 Vultr ops 钥以 `root` 连接，`Permission denied (publickey)`。没有改用其他钥匙，也没有登录成功。 |
-| 装机当时的新鲜 `pg_dump` 上重跑 Round 9 | 未关。腾讯云 `1.14.202.161` 这台机器没有可用的 SSH 钥。本机的 `genzltd_parity_1020` 是 10-20 转储，不能代替新转储。 |
+| 法兰克福 `45.76.84.90` 通道 | 已通。钥匙是 `id_ed25519_vultr_staging`，用户 `root`。`~/.ssh/config` 里原先没有 Host 段，新加坡那把 ops 钥会被拒绝。本机已补上 Host `vultr-staging`。 |
+| 预发库备份 | 已做。活动库 `/app/data/looma.db` 仍是 942,080 字节，mtime 未变。`VACUUM INTO` 的副本在 `/opt/vultr-genzltd-stack/backups/looma-staging-20261023.db`，sha256 `3b162fb0b675358558c29622a89b690d8ee10acdbdd26b4a589ef04453119c06`。此前该目录只有 10-13 的三份 compose 文件副本。 |
+| 预发演练 | 未开始。当前 `looma.db` 只有 1 个用户 `official@szbolent.com.cn`（`driver-official`），`orders` / `enterprises` / `applications` / `poems` 都是 0。这不是清理后的 7 人、58,059 首诗那份库。`gfcc` 库 7,575 kB。nginx 在公网 80/443，`server_name` 是 `_`。 |
+| 生产新鲜转储 | 不在本轮做。腾讯云和新加坡生产都不写入，也不把它们当成演练已成功的证据。 |
 
-未对腾讯云 `genzltd`、Vultr 活动库、法兰克福写入。
+未对腾讯云 `genzltd` 和新加坡活动库写入。法兰克福只新增了上述备份文件。
 
 ## 清单改了什么
 
