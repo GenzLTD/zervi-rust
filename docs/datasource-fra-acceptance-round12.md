@@ -9,13 +9,16 @@
 
 | # | 验收线 | 判定 | 依据 |
 |---|---|---|---|
-| 1 | 机器是可丢弃预发副本；先备份；不写 Vultr / 腾讯云 | ⚠️ **待办**（无法在 Mac 核实机器属性） | 本机 SSH 无此机；本轮未对它做任何操作 |
-| 2 | Round 9 脚本在新鲜转储上跑完并提交，事后行数达标 | ✅ **本轮首次达成**（在 55432 可丢弃库上） | 见 §2，五张表全中 |
-| 3 | JWT `sub` 属这 7 人且带 `exp`；`user-win-001` 不算；记忆门要八角梯角色 | ✅ **契约属实，全部在 main 上有代码依据** | 见 §3 |
-| 4 | 网关按契约答三下（503 / 200 双头 / 401 不转发） | ✅ **契约属实，实现在 `api-gateway/src/tatha.rs`** | 见 §4 |
-| 5 | 联调只读这 7 人 + zervi 的 2 条订单；Mac 三张表不进 | ✅ **属实，且有硬证据** | 见 §5 |
+| 1 | 机器是可丢弃预发副本；先备份；不写 Vultr / 腾讯云 | ⚠️ **仍开着**（Mac 无法代验机器属性） | 本机 SSH 无此机；本轮未对它做任何操作 |
+| 2 | Round 9 脚本在新鲜转储上跑完并提交，事后行数达标 | ⚠️ **半开**：脚本与流程已证明（§2 真 COMMIT、五张表全中）；**「新鲜转储」这一子项未达成** | 见 §2.6 |
+| 3 | JWT `sub` 属这 7 人且带 `exp`；`user-win-001` 不算；记忆门要八角梯角色 | ✅ **关闭** —— 契约属实，全部在 main 上有代码依据 | 见 §3 |
+| 4 | 网关按契约答三下（503 / 200 双头 / 401 不转发） | ✅ **关闭** —— 契约属实，实现在 `api-gateway/src/tatha.rs` | 见 §4 |
+| 5 | 联调只读这 7 人 + zervi 的 2 条订单；Mac 三张表不进 | ✅ **关闭** —— 属实，且有硬证据 | 见 §5 |
 
-**五条里四条已核实成立；第 1 条是机器侧待办，Mac 上无法代验。**
+**五条里第 3、4、5 条已关；第 1 条整条开着、第 2 条的「新鲜转储」子项开着。**
+⇒ 按 Win 侧口径：**还不算可以装上法兰克福。**
+
+> 状态更新见 **§8（Round 13 回执）**。
 
 ---
 
@@ -124,6 +127,25 @@ COMMIT
 > ⚠️ 仍须说明：本轮用的是 **10-22 的 `genzltd` 转储**，不是「装预发那一刻新打的新鲜转储」。
 > 验收线第 2 条要求的是后者——上机时需重打一份，本轮只能证明**脚本与流程本身走得通**。
 
+### 2.6 「新鲜转储」子项为什么还开着
+
+验收线第 2 条是一个合取条件，本轮只满足了一半：
+
+| 子项 | 状态 | 说明 |
+|---|---|---|
+| Round 9 脚本（含 `fff03d1` 企业归零）能跑完 | ✅ | 五道闸门全绿 |
+| 执行时带 `-v poems_gate=allow_created_at_skew` | ✅ | 显式给出 |
+| 逐条对过 NOTICE 后才 `commit` | ✅ | 见 §2.3 |
+| 事后五张表达标 | ✅ | users 7 / orders 2 / enterprises 0 / applications 0 / poems 58,059 |
+| **跑在「装预发那一刻新打的转储」上** | ❌ | 用的是 10-22 的旧转储 |
+
+⇒ **第 2 条判定为「半开」。** 上机前必须：新打一份 `pg_dump` → 重跑 Round 9 → 重新对行数，
+本轮的提交只证明脚本可执行，不能当作预发装的库。
+
+另记一处副作用（Round 13 复核）：**55432 的 `public` schema 已是清理后状态**
+（users 7 / orders 2 / enterprises 0），不能再当 Round 8/9 的基线；
+要基线须按 `scripts/merge/load_sg_snapshot_to_pg.py` 重建。
+
 ---
 
 ## 3. 第 3 条：身份体系（逐项在 main 上找到代码依据）
@@ -146,11 +168,17 @@ COMMIT
 > 注：`feat/gateway-actor-sub`（`e9eab3a`）**未入 main**，但 `X-Actor-Sub` 的实现
 > 已通过 `tatha.rs` 存在于 `origin/main`，两者不是同一份代码，勿据此判断契约缺失。
 
-| 场景 | 期望 | 代码依据 |
+| 场景 | 期望 | 代码依据（行号经 Round 13 逐行复核） |
 |---|---|---|
-| `TATHA_BASE_URL` 未配 | **503**，且不转发 | `tatha.rs:13`「未配 → 503，**绝不静默放行**（拒绝降级）」 |
-| 有 `sub` | **200**，下游见 `X-Actor-Sub` = 原始 sub、`X-User-Id` = `sha256(sub)` | `tatha.rs:16-19`；`tatha.rs:454-456` 插入两头；`tatha.rs:450` 先剥离客户端伪造头 |
-| 无 `sub` / 空 `sub` | **401**，且不转发 | `tatha.rs:414`「空白 sub 无法充当 memory.recall 的 actor，401 且不转发」；`tatha.rs:409` / `:418` |
+| `TATHA_BASE_URL` 未配 | **503**，且不转发 | 模块约束 `tatha.rs:13`「未配 → 503，**绝不静默放行**（拒绝降级）」；**实际代码** `tatha.rs:485-495`（`env_nonempty` 返回 None → `SERVICE_UNAVAILABLE`，`:491`） |
+| 有 `sub` | **200**，下游见 `X-Actor-Sub` = 原始 sub、`X-User-Id` = `sha256(sub)` | `tatha.rs:427` `stable_user_id(&claims.sub)`；`:450` 先剥客户端自带的 `X-Actor-Sub`；`:454` 写 `X-User-Id`；`:456` 写 `X-Actor-Sub` |
+| 空 `sub` | **401**，且不转发 | `tatha.rs:414` 注释「空白 sub 无法充当 memory.recall 的 actor，401 且不转发」；`:415` `claims.sub.trim()`；`:418` `("missing sub")` |
+| `sub` 不是合法 header 值 | **401** | `tatha.rs:424` `("invalid sub")` |
+| 缺/无效 bearer token | **401** | `tatha.rs:409` `("invalid or missing bearer token")` |
+
+> **勘误（Round 13，Win 侧指出）**：上一版把 `tatha.rs:409` 归到「空 sub」那一支，**错了**。
+> `409` 是 `verify_bearer` 返回 None（**缺 token 或 token 无效**）的 401；
+> 空 `sub` 是 `414`（注释）/ `418`（返回）这一支。**两者不是同一支。**
 
 `X-Actor-Sub` 的防伪造也有测试覆盖：`main.rs:818-840`「放行伪造值等于允许用别人的 sub 读 memory.recall」。
 
@@ -218,3 +246,90 @@ Win 侧的 PR #23（`docs/datasource-three-way-round11`）test plan 四项，本
 
 **副作用**：55432 的 `public` schema 现在是「清理后」状态（users 7 / orders 2 / enterprises 0），
 已不能再当 Round 8/9 的基线用。需要基线时按 `scripts/merge/load_sg_snapshot_to_pg.py` 重建。
+
+---
+
+## 8. Round 13 回执（Win 侧 2026-10-22 22:2x 确认）
+
+### 8.1 五条状态收口
+
+| # | 状态 | 收口依据 |
+|---|---|---|
+| 1 | ⚠️ **仍开** | 历史出处仍只有 `docs/handoff/2026-10-17-win-terminal.md:3` 那句「未碰」；本机 `~/.ssh/config` 无 `45.76.84.90`；本轮未连它。要有人确认「是可丢弃预发 + 先有备份」才关 |
+| 2 | ⚠️ **半开** | 脚本证明完成（真 COMMIT，NOTICE 与行数闭合：企业删 13→0、用户 10−4+1=7、订单 +2 且全属 zervi、poems 58,059、级联第 1 轮 59 行第 2 轮 0 行）；**但用的是 10-22 旧转储**，新鲜转储子项未达成（§2.6） |
+| 3 | ✅ **关闭** | 代码在 main 上对得上：`user-win-001` 在 `main.rs:837`（测试夹具，不在 7 人里）；用户服务默认库 MySQL `adirp_user`（`user-service/src/config/mod.rs:23`）；cortex 走 `CORTEX_DATABASE_URL`（`upload-service/src/config/mod.rs:201`）；`tatha.rs:110` 写明 `candidate` 返回 None；`jobfirst-slice-service/src/main.rs:232` 回 403 |
+| 4 | ✅ **关闭** | 见 §4（含本轮勘误） |
+| 5 | ✅ **关闭** | 按 Mac 实测收下：8 条 orders 的 6 个归属全是 `e2e-hr-*@test.local` / `gate_sup_*` / `planetxweb_*` / `tspace_*` 与空邮箱；`llm_usage` 9 条全在已删除的 `beta_admin` 上。零个落在 7 人名单里 ⇒「留表、不导行」不改 |
+
+⇒ Win 侧口径：**第 3、4、5 条关，第 1 条与第 2 条的「新鲜转储」还开着，所以还不算可以装上法兰克福。**
+
+### 8.2 勘误：`tatha.rs:409` 不是「空 sub」那一支
+
+上一版 §4 把 `409` 与 `414/418` 并列归到「无/空 sub」。**Win 侧指出错了，实测确认成立：**
+
+```
+tatha.rs:404-409   verify_bearer 返回 None → 401 "invalid or missing bearer token"   ← 缺/无效 token
+tatha.rs:414-418   claims.sub.trim() 为空   → 401 "missing sub"                      ← 空 sub
+tatha.rs:420-424   sub 不是合法 header 值   → 401 "invalid sub"                      ← 第三支
+```
+
+三条 401 **不是同一支**。§4 已按此改写，并补上 503 的实际代码位置 `tatha.rs:485-495`
+（原先只引了模块注释 `:13`，那条是「约束声明」不是实现）。
+
+### 8.3 一处与 Win 侧说法不一致：本机检出并不在 `feat/zervi-rust-gap-close`
+
+Win 侧回执写「你的检出仍在 `feat/zervi-rust-gap-close` 的 `c6a2ee3`」。**实测不成立：**
+
+```
+$ cat .git/HEAD
+ref: refs/heads/main
+$ git rev-parse --abbrev-ref HEAD   → main
+$ git rev-parse --short HEAD        → 55faeee
+$ git status --porcelain            → (空，工作区干净)
+$ git worktree list                 → 只有一个：/Users/jason/Projects/zervi-rust  55faeee [main]
+$ git branch --list feat/zervi-rust-gap-close  → (本地无此分支)
+```
+
+`c6a2ee3`（`feat(services): 实现 looma /v1 三十五端点`，szjason72，10-16 23:51）**对象在本机存在**，
+且是 `origin/main` 的祖先（所有 `docs/datasource-*` 分支都包含它）；
+远端确有 `origin/feat/zervi-rust-gap-close` 指向它，但**本机没有对应的本地分支，也没有检出它**。
+Round 12 收尾时已 `git checkout main` 并对齐到 `55faeee`。
+
+⇒ 这条按本机实测记录，供 Win 侧比对。若 Win 侧看到的是另一台机器的检出，请指明是哪一个。
+
+### 8.4 PR 处置
+
+| PR | 处置 | 说明 |
+|---|---|---|
+| **#21** | **保持 OPEN，不合并** | `docs/single_source_authority_lockdown.md` 是 Win 侧资产，本轮仍未合入 main，未在规范引用链里 |
+| **#23** | ⚠️ **已加说明评论，关闭动作失败（权限不足）** | 其 test plan 四项已全部落进 #24 / 本文档 §0、§5.2、§5.3、§7；合进去只是把 Round 11 原文再留一份，重复且无新信息。**但本机关不掉它**，见 §8.4.1 |
+| **#24** | MERGED | `55faeee`，父提交 `d780691` + `1a8319f`，真两亲 merge，提交号未被改写 |
+| **#22** | MERGED | `d780691` |
+
+#### 8.4.1 为什么关不掉 PR #23
+
+```
+$ gh pr close 23
+GraphQL: 8bt8rcrg95-coder does not have the correct permissions to execute `ClosePullRequest`
+$ gh api repos/GenzLTD/zervi-rust --jq .permissions
+{"admin":false,"maintain":false,"pull":true,"push":false,"triage":false}
+$ gh api -X PATCH repos/GenzLTD/zervi-rust/pulls/23 -f state=closed
+HTTP 404 Not Found        ← 无权即隐藏，与 10-01 那条「GitHub 对无权访问的私有仓返回 404」同族
+```
+
+本机 gh 登录身份是 **`8bt8rcrg95-coder`**（GenzLTD 普通 member，`push:false`），
+org-admin 是 `szpeter2026` / `szjason72`（SSH 通道正常，但** API 层本机没有可用的 admin token**，
+钥匙串里那条已失效）。⇒ **关闭 PR #23 需由 Win 侧或持有 admin token 的人执行。**
+
+已做的替代动作：在 PR #23 上留了一条说明评论
+（[comment](https://github.com/GenzLTD/zervi-rust/pull/23#issuecomment-6343335834)），
+逐项列出 test plan 四项的落点，说明「只关闭不合并」的理由，
+避免它被误当成「未处理」而重新打开或合并。
+
+### 8.5 本轮边界
+
+**未做**：未连接/未操作法兰克福 `45.76.84.90`；未合并 PR #21；PR #23 只关闭不合并；
+未对腾讯云 `1.14.202.161` 的 `genzltd` 做任何写操作；未对 Vultr 活动库做任何写操作。
+
+**做了**：两仓 fetch 同步；仓库内逐行复核 `tatha.rs` / `main.rs` / `user-service` /
+`upload-service` / `jobfirst-slice-service` 的契约代码行号；改本文档 §1–§5、新增 §8。
