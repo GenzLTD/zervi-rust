@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 对侧（脚本侧） | `looma-zervi` @ `ops/pg-export-safe-default` | **`46ae918`** | 导出脚本：默认不清表 + `source_sanity()` 源库身份自检 |
 | 本侧（文档侧） | `zervi-rust` @ `docs/datasource-authority-round3` | `7592ff8`（pre-pin） | Round 3 全文（不含本节） |
-| 本侧 tip | 同上分支 | `a886a6ce` 的子提交 | 本文档当前版本（含 Round 4 生产快照） |
+| 本侧 tip | 同上分支 | `71a2c97` 的子提交 | 本文档当前版本（含 Round 4 生产快照 + Round 5 目标库核查） |
 
 自引用不写入正文（否则需要先知道自己 SHA，会自相矛盾）；**当前 tip 以分支头为准**，
 引用本文档时请写分支 tip，`7592ff8` 保留为 pre-pin 引用。
@@ -429,3 +429,89 @@ python3 backend/scripts/export_sqlite_to_pg.py \
    可在业务低峰重启 backend 容器让 SQLite 自行回收。
 3. 未核验腾讯云 `1.14.202.161` 的 genzltd 容器 —— 缺 SSH 凭据，需你提供。
 4. 未做 data.sql 全量导出（只跑 `--schema-only` 验证预检开关）。
+
+---
+
+# Round 5 · 目标库核查：genzltd 不是空壳，且有第二套生产数据（2026-10-22 08:2x GMT+8）
+
+> 前提纠正：Round 4 我写"目标库落点未闭环（缺凭据）"。**凭据同样一直在本机**
+> —— `~/.ssh/looma-key.pem`（`~/Downloads/looma_key.pem` 是另一把，两把都**能**登，
+> 用户是 **`ubuntu`** 不是 `root`）。本机 `~/.ssh/config` 没有对应 Host 条目，
+> 所以按 IP 直连即可。
+
+```bash
+ssh -i ~/.ssh/looma-key.pem ubuntu@1.14.202.161     # VMware/腾讯云 CVM，hostname VM-0-9-ubuntu
+```
+
+## 腾讯云 1.14.202.161 实测（只读）
+
+| 项 | 值 |
+|---|---|
+| 容器 | `looma-pgvector`(pg17, up 10 天 healthy)、`looma-backend`、`looma-chromadb`、`looma-redis` |
+| 另有两个无关容器 | `bolent_wp`、`bolent_wp_mysql` |
+| `genzltd` 对象数 | **59 表 + 1 视图**（`v_catalog_tenants`） |
+| 后端数据源 | `DATABASE_PATH=/app/data/looma.db`（**腾讯云后端本身也是 SQLite 在跑**）、`CHROMA_MODE=remote` |
+| `/app/data/looma.db` | 33,607,680 B，mtime 2026-10-19 08:35，sha256 `d91d929e…07492`，journal=wal |
+| 境内 genzltd 与境内 SQLite | users/consents/timeline_events/applications/orders/poems/documents **逐表完全相等** |
+
+## 三份库的对拍（逐表行数）
+
+| 表 | SG SQLite（海外生产） | 腾讯云 SQLite（境内生产） | 腾讯云 genzltd（PG） |
+|---|---:|---:|---:|
+| users | **11** | 10 | 10 |
+| consents | **27** | 14 | 14 |
+| timeline_events | **68** | 19 | 19 |
+| applications | 9 | **23** | 23 |
+| orders | **2** | 0 | 0 |
+| documents | **39** | 30 | 30 |
+| poems | 58,059 | 58,059 | 58,059 |
+| chunks | 0 | 0 | 0 |
+
+**两个结论，都推翻此前的迁移前提：**
+
+1. **目标库不是空的。** genzltd 有 59 张表、10 个用户、5.8 万诗词、以及业务数据。
+   旧默认（`drop=True`）若被 apply 到这里，会**当场清掉这 59 张表**。
+   ⇒ Round 3 把默认值反转成"不清表"这件事，在这里拿到了最强实证。
+2. **存在两套独立演进的生产数据，不是一份的副本。**
+   - 境内 SQLite 与境内 genzltd 逐表相等（PG 是境内 SQLite 的镜像）；
+   - SG 与境内**互有独有**：SG 多 1 用户（`zervi@genz.ltd`，按 DATA-PLANE 设计本就不进境内）、
+     13 consents、49 timeline_events、2 orders、9 documents；境内多 14 applications。
+   - 只有 `poems` 三方一致（58,059）——同一批外部语料导入，再次印证它无判别力、也不必迁移。
+
+⇒ **"以 X 为准"在两份生产数据之间没有答案。** 以 SG 为准会丢境内的 14 applications；
+以境内为准会丢 SG 的 1 用户 + 13 consents + 49 timeline_events + 2 orders + 9 documents。
+
+## 表结构差异（SG SQLite 55 表 vs genzltd 59 表）
+
+- **PG 独有 4 张**（且当前**全为空表**）：`tenants`(0)、`tenant_shelf_items`(0)、
+  `apple_iap_transactions`(0)、`iap_subscriptions`(0)
+- **SQLite 独有 0 张**：SQLite 的 55 张在 PG 里全部存在
+- 视图 1 个：`v_catalog_tenants`
+
+⇒ 结构上是 PG ⊇ SQLite（55∩55 + 4 空表 + 1 视图），不存在"SQLite 有而 PG 没有"的表。
+
+## 本轮只做了只读操作
+
+- 未 apply 任何 SQL、未执行 `--recreate`、未动任何容器；
+- 仅有的副作用同 Round 4：只读打开会在 `/app/data` 生成 `-shm`(32KB)/`-wal`(0B)，
+  非数据变更。
+
+## 由此改写的迁移命题
+
+原命题「把生产 SQLite 整库导入 genzltd」**不成立**：目标库已有数据，且源有两边。
+新命题应为：
+
+1. **定权威**：SG（海外，11 users）与境内（10 users）谁是/谁是两份并列的事实源？
+   —— 若业务上本就是"境外/境内两套独立租户"，则**根本没有单源**，应改为**分域迁移**，
+   而不是合并。这需要在战略文本里先定性，才能谈执行。
+2. **若按分域**：境内那份已经在 PG 里（境内 SQLite == genzltd），**境内不需要再迁移**；
+   要动的只是 SG 那份。
+3. **若按合并**：必须先逐表做**主键集合级**对拍（本轮只做到行数级，行数差异 ≠ 内容差异），
+   再逐表定 union / 单边优先 / 冲突解决规则。
+4. **无论哪种**：apply 前必须先备份 genzltd（`pg_dump`），且脚本**默认不清表**已是硬要求。
+
+## 本轮未做
+
+1. 未做非 users 表的**主键集合**对拍（只有行数）⇒ 规模差异已知，内容差异未知。
+2. 未判断境内 genzltd 是"静态镜像"还是"持续同步"（需看是否有同步任务/`updated_at` 分布）。
+3. 未备份 genzltd（`pg_dump` 会落 ~30MB 文件到目标机，需先确认放置位置）。
