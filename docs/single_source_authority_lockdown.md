@@ -1,8 +1,9 @@
 # 单源迁移 · 权威源锁定清单（Authority Lockdown Checklist）
 
 > 起草：嘟嘟（Win 侧）｜2026-10-22
-> 配合：Mac 侧 `export_sqlite_to_pg.py` 已 hardening（commit `46ae918`，分支 `ops/pg-export-safe-default`）
-> 目标：在跑任何 `export_sqlite_to_pg.py` 导出 / apply 之前，先锁定「哪个 SQLite 是权威源」，
+> 修订：Win 本机｜2026-10-23（Round 14）。第 3 项已改：三方没有超集，禁止锁定单一文件，禁止 `--recreate`。
+> 配合：Mac 侧 `export_sqlite_to_pg.py` 已 hardening（`46ae918` 已在 `looma-zervi` `main` `06bc5b5`）
+> 目标：在跑任何 `export_sqlite_to_pg.py` 导出 / apply 之前，先确认能不能锁定权威源，
 >       避免把测试 / 种子数据灌进生产 `genzltd`（腾讯云 1.14.202.161 · looma-pgvector）。
 >
 > 已据 Round 2/3 实测修正的两点战略前提：
@@ -42,7 +43,7 @@ python3 backend/scripts/export_sqlite_to_pg.py \
 -- 在生产主机 SQLite 上（只读连接内执行）
 VACUUM INTO '/tmp/snapshot_YYYYMMDD.db';   -- 生成一致快照，不写原库
 ```
-随后所有对账 / 导出都针对该快照文件。**我（Win 侧）无 Vultr 凭据，这一步需你或运维执行。**
+随后所有对账 / 导出都针对该快照文件。SG 活动库的 10-22 快照已经取过（`6b08bdae…79b509` 与 fresh `735e08db…ac0986` 判定同源）。本机有 Vultr ops 钥；原「Win 侧无凭据」作废。腾讯云 `genzltd` 的新鲜 `pg_dump` 这台机器仍做不了。
 
 ---
 
@@ -61,16 +62,20 @@ VACUUM INTO '/tmp/snapshot_YYYYMMDD.db';   -- 生成一致快照，不写原库
 
 ---
 
-## 第 3 项：判定权威源
+## 第 3 项：没有超集就停
 
-权威源 = 同时满足：
-- (a) 第 0 项**绿**；
-- (b) 业务表 `created_at` 跨度**最新**（数据最新）；
-- (c) 业务表 PK 集合 + 行数对得上 / 不落后于其他候选。
+Round 10 到 Round 13 已实测：Mac 本地、SG、腾讯云 PG 三方互补，没有一方是另外两方的超集。下面三条因此不能同时成立，不得选出一个 SQLite 文件当权威源：
 
-判定后：
-- 仅对**确认目标** `genzltd` 用 `--recreate`（生成 `DROP TABLE … CASCADE`）；
-- 其余情况一律用**默认（不清表）** `CREATE TABLE IF NOT EXISTS`，绝不把默认 DROP 误 apply 到未确认库。
+- (a) 第 0 项绿；
+- (b) 业务表 `created_at` 跨度最新；
+- (c) 业务表主键集合与行数不落后于其他候选。
+
+在没有超集时禁止：
+
+- 把 Mac `looma.db`、SG 活动库或任何一份旧转储整库灌进 `genzltd`；
+- 对腾讯云 `1.14.202.161` 的 `genzltd`、Vultr 活动库执行 `--recreate` 或 `DROP TABLE … CASCADE`。
+
+预发副本只允许装 Round 9 清理结果（`docs/datasource-clean-draft-round9.sql`，含企业归零）。装之前还要同时满足：机器已确认可丢弃且已备份；来源是装机当时新打的 `pg_dump`；执行时带 `-v poems_gate=allow_created_at_skew`；NOTICE 对过才 `commit`；事后 `users` 7、`orders` 2、`enterprises` 0、`applications` 0、`poems` 58059。这两条在 Round 14 仍开着，所以现在也不装预发。导出脚本默认保持不清表。
 
 ---
 
@@ -97,7 +102,7 @@ docker exec -i looma-pgvector psql -U looma -d genzltd -f - < verify.sql
 ## 第 6 项：通过后才进入评审落地的迁移顺序
 
 ① 只读导出 + 行数对拍（已含本清单前 5 项）→ ② 决策那 5 张表（articles/columns/driver_profiles/signal_dlq/signal_outbox，
- 其中 signal_dlq/signal_outbox 为可靠性组件，建议必留）→ ③ **仅在 poetry 搜索被立项时**才做 pgvector 方案 →
+ 其中 signal_dlq/signal_outbox/llm_usage **必留的是表**。Mac 上现有的行不导入：8 条 orders、9 条 llm_usage、4 条 signal_outbox 都不属于预发保留的 7 个用户）→ ③ **仅在 poetry 搜索被立项时**才做 pgvector 方案 →
 ④ looma `manager.py` 切 PG 或退役 → ⑤ 网关砍 fallback → ⑥ **最后**才删 SQLite。
 
 > 不可逆的一步（删 SQLite / 砍 fallback）永远放最后；此前任何步骤都可回滚。
@@ -105,8 +110,7 @@ docker exec -i looma-pgvector psql -U looma -d genzltd -f - < verify.sql
 ---
 
 ## 待办 / 责任分工
-- **Win 侧（嘟嘟）**：本清单起草；Vultr fresh dump 需你或运维跑（无凭据）。
-- **Mac 侧（评审）**：认领重写战略文本「规模与工作量」段落（poems 排除 + collection 定性后的真实规模）；
-  推动 `46ae918` 合入；`--no-drop` 默认化已落地。
-- **共同**：两份本地 commit（`looma-zervi` `46ae918`、`zervi-rust` `7592ff8`）推送前先对齐，避免与 Win 侧未推送的
-  `zervi-rust` 改动（main `1a3850a` 提交 `scripts/local-verify.sh`、本地独有 `adr-0012/gateway-dualtrack`）同名文件打架。
+
+- **预发通道已通，演练未做**：法兰克福 `45.76.84.90` 用 `id_ed25519_vultr_staging` 登录。2026-10-23 已对活动库做 `VACUUM INTO` 备份（sha256 `3b162fb0…19c06`），活动库本身未改。当前库只有 `driver-official` 一名用户，还不是清理后的那份数据。新加坡活动库和腾讯云生产在演练成功前不写入。
+- **已落地**：`46ae918` 在 `looma-zervi` `main`。SG 10-22 快照已判定同源。Mac 三张表的行不进预发。
+- **禁止**：在第 3 项的两条门关上之前执行 `--recreate`，或把本清单旧版「锁定单一文件」当作操作许可。
