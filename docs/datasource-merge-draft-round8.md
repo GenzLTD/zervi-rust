@@ -85,11 +85,11 @@ G3 校验通过（users=11 且 email 唯一、4 个丢弃 UUID 零残留、poems
 | # | 文档口径 | 实测 | 影响 |
 |---|---|---|---|
 | 1 | `challenge_rounds`：W29–31 / W36–39 无重叠，并集 9 | **2026-W36 两侧各有一条**：PG id=1《輞川集二十首 斤竹嶺》、SG id=5《華嚴寺望樊川》，均 closed、同 starts_at | 撞 `uq_challenge_rounds_week_key`。草案默认保留 PG、跳过 SG ⇒ **净 8（文档 9）** |
-| 2 | `enterprises`：测试残留 13 条；name 交集 1 条；净 20 | 测试残留 **12 条**（Overseas Browser ×3、Overseas E2E ×7、DebugCo ×2）；「闭环测试企业」SG **6 条** + PG **7 条** = 13 条同名 | 按"留一条"需 DELETE PG 侧 6 行 ⇒ **净 10（文档 20）**。已确认 `enterprise_users` 引用的是"测试用户-*"不是闭环、`applications.enterprise_id` 全空 ⇒ 删除不产生孤儿 |
+| 2 | `enterprises`：测试残留 13 条；name 交集 1 条；净 20 | 测试残留 **12 条**（Overseas E2E ×7、Overseas Browser ×3、DebugCo ×1、DebugCo2 ×1）；「闭环测试企业」SG **6 条** + PG **7 条** = 13 条同名 | 按"留一条"需 DELETE PG 侧 6 行 ⇒ **净 10（文档 20）**。已确认 `enterprise_users` 引用的是"测试用户-*"不是闭环、`applications.enterprise_id` 全空 ⇒ 删除不产生孤儿 |
 | 3 | `timeline_events`：按 (user,title) 去重 7 条 → 净 80 | 7 组里「对话交互」一组是 SG 12 + PG 5 = 17 行，**occurred_at 各不相同** | 按 title 去重会丢 16 条真实对话。草案默认改 **(user,title,occurred_at)** ⇒ **净 87** |
 | 4 | `trust_memories`：memory_content 交集 1（星云艺术家 JSON），净 ≤56 | 按 (canon, session_type, memory_content) 重叠 **0 组** | 全并集 ⇒ **净 57** |
 | 5 | `applications`：交集 1，两边同为 withdrawn | 交集确为 1（fcf2c1fc / j1 / resume 23），但 **PG 那条是 `submitted`**（08-08 20:35:25），SG 是 withdrawn（21:35:42） | 草案默认保留 PG 现有行、跳过 SG ⇒ 净 31（与文档一致，但"同为 withdrawn"的表述不成立） |
-| 6 | `users`：共同 UUID 的 6 人中 password_hash 4 个不同 | 共同 **UUID** 的 6 人 `password_hash` **完全一致**（pw_diff 全 false）；`created_at` 只有 driver-official 不同 | 拍板 1 对这 6 人的实际效果是：只有 driver-official 的 created_at/updated_at 有差异，其余 5 人 no-op。"4 个 bcrypt 不同"说的是 email 相同但 UUID 不同的 beta 4 人 |
+| 6 | `users`：共同 UUID 的 6 人中 password_hash 4 个不同 | 共同 **UUID** 的 6 人 `password_hash` **完全一致**（pw_diff 全 false）；`created_at` 只有 driver-official 不同，且它**两侧 password_hash 均为空**（Win 本机复核同口径） | 拍板 1 对这 6 人的实际效果是：只有 driver-official 的 created_at/updated_at 有差异（口令两侧皆空，无安全含义），其余 5 人 no-op。"4 个 bcrypt 不同"说的是 email 相同但 UUID 不同的 beta 4 人 |
 
 被丢弃 UUID 的引用分布复核：**20 / 0 / 39 / 81 = 140**，与文档逐表逐 UUID 完全一致 ✅
 （consents 17 · timeline_events 41 · quota_records 19 · trust_memories 18 · match_reports 10 · applications 9 ·
@@ -191,3 +191,73 @@ enterprise_users 2 · invite_codes.created_by 2 · share_codes.owner 2 · verifi
    超出拍板范围，列为待确认。
 4. `driver_profiles` 的 PG 独有列 `status='active'` 按拍板 3 保持不动（SG 侧无此列）。
 5. 未跑 25 张相同表里 22 张双空表的字段比对（拍板说不用做）。
+
+---
+
+## 8. Round 8 复核（Win 回执 · 2026-10-22）
+
+以下全部是对**远端 tip** 的实测，补入本文档以免口头结论丢失。
+
+### 8.1 跨仓互钉
+
+| 项 | 实测结果 |
+|---|---|
+| zervi-rust `origin/main` | `742dd05` |
+| `datasource-authority-mac-response.md` 第 13 行 | `looma-zervi` @ `ops/pg-export-safe-default` = **`46ae918`** ✅ |
+| 同文件第 14、18 行 | **`7592ff8`**（pre-pin）✅ |
+| 同文件是否含 `a886a6ce` | **不含**（`grep` 无命中）。`a886a6ce` 是 `docs/datasource-authority-round3` 的分支尖端，从未写入正文 |
+| zervi-rust 祖先关系 | `a886a6ce` / `7592ff8` / `71a2c97` / `73277cb` / `ef63b9a` / `5cc7c5b` 全部 `is-ancestor origin/main` ✅ |
+| looma-zervi `origin/main` | **`06bc5b5`**，parents = **`c8e3455` `46ae918`** —— PR #28 的**真两亲 merge commit** |
+| `46ae918` 对 looma main | IS ancestor ✅ |
+| `a886a6ce` / `7592ff8` 在 looma-zervi | **对象不存在** ⇒ 反向钉只存在于 PR #28 的描述里（含"禁止 squash"） |
+| `742dd05` 改动面 | 仅 3 个新文件（md / sql / py），**未动 `datasource-authority-mac-response.md`** ⇒ 前向钉未被触及 |
+
+### 8.2 上一轮误判的根因：本地 `main` 过期
+
+本机 `refs/heads/main` 停在 `4ec064b`（未 fetch），而 `origin/main` 已到 `742dd05`。
+对着过期的本地 ref 跑 `git merge-base --is-ancestor a886a6ce main` 得到 **NOT ancestor** 的假阴性，
+据此一度反向质疑了本来为真的互钉。已 fast-forward 两个仓的本地 `main`
+（本机主线无独有提交，fast-forward 安全）：
+
+- zervi-rust `main` → `742dd05`
+- looma-zervi `main` → `06bc5b5`
+
+**纪律：判祖先/判远端状态一律先 `git fetch`，对 `origin/<branch>` 判，不要相信本地主线的陈旧 ref。**
+
+### 8.3 PR #17 的真实形态（勘误）
+
+`742dd05` **只有一个父提交 `1a46a6d`**，不是 merge commit：
+
+```
+number=17  state=closed  merged=true
+merge_commit_sha == head.sha == 742dd05e3dd250903a95eab8280954c464455ccc
+merged_by = szpeter2026
+```
+
+分支从 `origin/main`（=`1a46a6d`）切出、只加一个提交后再推回 main ⇒ GitHub 记为
+**fast-forward 合并**，`merge_commit_sha` 指向 head 本身，**没有生成 merge commit**。
+禁令（禁止 squash / SHA 不得变）仍然守住；但上一轮汇报里写成"merge commit `742dd05`"不准确，以此为准。
+
+另外 `a8d541b..742dd05` 共 **9 个提交**（Round 4/5/6/7 各提交 + 各 merge commit + Round 8），
+不只有 Round 8 一个。
+
+### 8.4 Win 本机独立复核（未复跑 staging、未登录腾讯云）
+
+| 核对项 | Win 本机 | 与本文档第 3 节 |
+|---|---|---|
+| SG 测试残留企业 | 12 条（Overseas E2E 7 / Overseas Browser 3 / DebugCo 1 / DebugCo2 1） | 一致 ✅（不再是先前拍板的 13） |
+| 闭环测试企业 | SG 6 + PG 7 = 13 条同名 ⇒ 净 10 | 一致 ✅ |
+| `poems` | 两侧均 58,059 行、主键一一对应；`created_at` 全不同；业务列差异 0 | 与 G1 一致 ✅ |
+| 6 个共同 UUID 的 `password_hash` | 一致；driver-official 两侧**均为空口令**，仅 `created_at` 不同 | 一致 ✅ |
+
+⇒ 四点独立复核全部吻合。但 staging 上的行清单、G3 校验、草案执行结果仍**只有 Mac 侧证据**，
+服务器侧无法再证一次（本轮未登录腾讯云）。
+
+### 8.5 生产前置状态更新
+
+- **SG 快照不缺**：本机 `snapshots/looma-sg-20261022.db`，sha256 `6b08bdae…9b509`（30,818,304 B），
+  与 10-22 从生产取的快照是同一份；活动库自 10-18 起无新数据 ⇒ §6 前置 0 的**数据源已就位且有效**。
+- 仍未做的三项：把 `sg` schema 导入生产库、执行前的**新鲜 `pg_dump`**（PG 侧备份，与 SG 快照是两回事）、
+  停写。
+- 两个仓都**不存在** `single_source_authority_lockdown.md` ⇒ 没有回写目标；
+  本轮勘误只落在本文档内，不另抽清单。
