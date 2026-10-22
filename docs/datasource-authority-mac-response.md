@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 对侧（脚本侧） | `looma-zervi` @ `ops/pg-export-safe-default` | **`46ae918`** | 导出脚本：默认不清表 + `source_sanity()` 源库身份自检 |
 | 本侧（文档侧） | `zervi-rust` @ `docs/datasource-authority-round3` | `7592ff8`（pre-pin） | Round 3 全文（不含本节） |
-| 本侧 tip | 同上分支 | `71a2c97` 的子提交 | 本文档当前版本（含 Round 4 生产快照 + Round 5 目标库核查） |
+| 本侧 tip | 同上分支 | `73277cb` 的子提交 | 本文档当前版本（含 Round 4–6） |
 
 自引用不写入正文（否则需要先知道自己 SHA，会自相矛盾）；**当前 tip 以分支头为准**，
 引用本文档时请写分支 tip，`7592ff8` 保留为 pre-pin 引用。
@@ -515,3 +515,113 @@ ssh -i ~/.ssh/looma-key.pem ubuntu@1.14.202.161     # VMware/腾讯云 CVM，hos
 1. 未做非 users 表的**主键集合**对拍（只有行数）⇒ 规模差异已知，内容差异未知。
 2. 未判断境内 genzltd 是"静态镜像"还是"持续同步"（需看是否有同步任务/`updated_at` 分布）。
 3. 未备份 genzltd（`pg_dump` 会落 ~30MB 文件到目标机，需先确认放置位置）。
+
+---
+
+# Round 6 · 主键集合级对拍（2026-10-22 08:4x GMT+8）
+
+评审选择"合并：先把两边合成一个事实源"。本轮按你的口径做到**主键集合级**（不再是行数级）。
+
+## 先做的保险：目标库已备份
+
+```
+docker exec looma-pgvector pg_dump -U looma -d genzltd | gzip > /tmp/genzltd-20261022.sql.gz
+sha256 = 8c50e17db07a78574bcb7faeec5f3c5e8d7fd28378a82bfc9eafee138fa40aba   (7,804,995 B)
+```
+已拉回本机 `snapshots/genzltd-20261022.sql.gz`，两端 sha256 一致，目标机 `/tmp` 已清空。
+
+## 对拍方法（可对拍复现）
+
+- 口径：`PG 主键列的 md5(string_agg(key::text, ',' order by key::text))`，SG 侧用同一组列、
+  同一排序规则（按**文本**排序，避免 SQLite 整数序 vs PG 文本序不一致）逐表计算 md5。
+- 两侧主键列定义已核对一致（`act1_sessions→session_id`、`signal_ingest→3 列`、
+  `value_imprints→user_id` 等复合/非 id 主键都相同）。
+- 55 张共有表全覆盖。
+
+## 结果总览
+
+| | 张数 |
+|---|---:|
+| 主键集合**完全相同** | **25** |
+| 主键集合不同 | 30 |
+| 其中 **两侧完全无交集**（整表互斥） | **20** |
+| 其中 SG 空 / PG 有数据 | 6 |
+| 其中 PG 空 / SG 有数据 | 6 |
+
+**主键集合相同的 25 张**（含 `poems` 58,059，可直接不动）：
+`articles` `boost_consumptions` `boost_packs` `candidates` `challenge_entries` `chunks`
+`columns` `driver_profiles` `emergent_strategy_log` `huawei_push_tokens` `job_posts`
+`llm_usage` `match_consensus` `narrative_feedback` `navigator_memories` `poems`
+`quiz_sessions` `report_sharing` `sales_inquiries` `signal_dlq` `signal_ingest`
+`signal_outbox` `subscriptions` `usage_logs` `user_identities`
+
+## 30 张差异表的并集账（SG / PG / 交集 / 仅SG / 仅PG）
+
+| 表 | SG | PG | 交集 | 仅 SG | 仅 PG |
+|---|---:|---:|---:|---:|---:|
+| `audit_logs` | 225 | 37 | 0 | 225 | 37 |
+| `timeline_events` | 68 | 19 | 0 | 68 | 19 |
+| `query_logs` | 69 | 13 | 0 | 69 | 13 |
+| `trust_memories` | 29 | 28 | 0 | 29 | 28 |
+| `product_events` | 25 | 28 | 2 | 23 | 26 |
+| `consents` | 27 | 14 | 0 | 27 | 14 |
+| `enterprises` | 21 | 13 | 0 | 21 | 13 |
+| `quota_records` | 29 | 4 | 0 | 29 | 4 |
+| `applications` | 9 | 23 | 0 | 9 | 23 |
+| `documents` | 39 | 30 | 30 | 9 | 0 |
+| `users` | 11 | 10 | 6 | 5 | 4 |
+| `mission_completions` | 8 | 5 | 0 | 8 | 5 |
+| `trust_attestations` | 8 | 3 | 0 | 8 | 3 |
+| `game_profiles` | 7 | 3 | 0 | 7 | 3 |
+| `enterprise_users` | 2 | 5 | 0 | 2 | 5 |
+| `fleet_members` | 4 | 2 | 0 | 4 | 2 |
+| `fleets` | 4 | 2 | 0 | 4 | 2 |
+| `challenge_rounds` | 6 | 3 | 3 | 3 | 0 |
+| `narrative_events` | 0 | 43 | 0 | 0 | 43 |
+| `act1_sessions` | 0 | 14 | 0 | 0 | 14 |
+| `domain_visits` | 0 | 14 | 0 | 0 | 14 |
+| `narrative_sessions` | 0 | 14 | 0 | 0 | 14 |
+| `micro_feedback` | 0 | 2 | 0 | 0 | 2 |
+| `value_imprints` | 0 | 2 | 0 | 0 | 2 |
+| `invite_codes` | 3 | 0 | 0 | 3 | 0 |
+| `match_report_items` | 11 | 0 | 0 | 11 | 0 |
+| `match_reports` | 11 | 0 | 0 | 11 | 0 |
+| `share_codes` | 4 | 0 | 0 | 4 | 0 |
+| `verification_audit_log` | 6 | 0 | 0 | 6 | 0 |
+| `orders` | 2 | 0 | 0 | 2 | 0 |
+| **合计（差异表）** | | | **41** | **587** | **290** |
+
+⇒ 差异表并集行数 = 587 + 290 + 41 = **918**。
+
+## ⚠️ 决定性的陷阱：主键互斥 ≠ 业务不重复
+
+`users` 表：
+
+| 口径 | 值 |
+|---|---|
+| 按 UUID 交集 / 并集 | 6 / **15** |
+| 按 **email** 交集 / 去重后 | 10 / **11** |
+| email 相同但 UUID 不同的账号 | **10 个**（含 4 个 `beta_*@looma.test`） |
+
+⇒ 按主键做 union 会得到 **15 个用户**，其中 10 个邮箱重复；真实只有 **11 个人**。
+**4 个 beta 账号在两边各自创建、UUID 不同、邮箱却完全一样。**
+
+⇒ 合并规则**不能**只按主键：对 `users` 必须以 **email 为业务唯一键**去重，
+否则合并后的库立刻出现重复账号（登录/订阅/订单会跟着分裂）。
+
+## 由此得出的合并规则建议（待你拍板）
+
+1. **25 张主键集合相同的表**：无需处理（包括 `poems`，直接沿用任一侧）。
+2. **20 张完全互斥的表**：直接 union 即可（无主键冲突）；但要先确认
+   这些行在业务上是否本就该合并（例如 SG 的 `orders` 2 条、境内的 `applications` 23 条，
+   是"同一业务的两个阶段"还是"两个独立产品的各自数据"）。
+3. **`users`（及其他有业务唯一键的表）**：先按 email 去重，再决定保留哪一侧的 UUID，
+   并**回写外键引用**（`consents.user_id`、`timeline_events.user_id`、`orders.user_id`…）——
+   这是本次合并里唯一有真实风险的一步。
+4. **顺序**：先 `users` → 再依赖 `user_id` 的表 → 其余。
+
+## 本轮未做
+
+1. **字段级比对**：主键相同的行（如 `documents` 的 30 行、`users` 的 6 行）内容是否一致，未比。
+2. **外键引用完整性**：UUID 重映射会牵动外键，未做影响面清单。
+3. 未执行任何写入；目标机仅临时落过 `pg_dump`/两个 SQL，均已删除。
