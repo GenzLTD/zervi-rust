@@ -21,9 +21,28 @@
 //! ## environment 分流（沙盒污染防线）
 //!
 //! `data.environment == "Sandbox"` 的通知：`iap_subscriptions` 照记
-//! （environment 列隔离），但**绝不触碰 `users.tier`** —— 沙盒购买不得
-//! 转正生产权益。Production 才走 `UPDATE users SET tier`（借
-//! `resolve_principal` 每请求查库，下一请求实时生效）。
+//! （environment 列隔离），是否计入权益由库内配置项决定，不再硬编码在代码里：
+//!
+//! ```sql
+//! UPDATE entitlement_config SET value='true' WHERE key='include_iap_sandbox';
+//! ```
+//!
+//! 默认 `false`（沙盒不得转正生产权益）。联调 IAP 轨时打开即可端到端验证，
+//! **无需改代码重新发版**。判定集中在 `v_active_entitlements` 视图里。
+//!
+//! ## tier 由 entitlement 仲裁层统一裁决（不再各自 UPDATE）
+//!
+//! 本服务**不直接写 `users.tier`**，而是写订阅表后调 `recompute_user_tier()`：
+//!
+//! ```text
+//! tier      = max( 两条轨上所有未过期订阅的 tier )    # Stripe 轨 + Apple IAP 轨
+//! 降级 free  = 仅当两条轨都没有有效订阅
+//! ```
+//!
+//! 原因：旧写法是 last-write-wins —— IAP 一到期/退款就把 tier 打成 free，
+//! 会把用户在 Web 侧**仍然有效**的 Stripe 订阅连带抹掉（已付费权益消失）。
+//! 另有 `trg_iap_subscriptions_recompute_tier` 触发器兜底，防止漏调。
+//! 详见 `entitlement_arbitration.sql`。
 //!
 //! ## SUBSCRIBED 先于 verify 到达的缺口
 //!
@@ -45,7 +64,7 @@ use common::looma::{
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
     sea_query::Expr,
 };
 use serde::{Deserialize, Serialize};
@@ -321,12 +340,13 @@ async fn activate_for_user(state: &AppState, principal: &Principal, tx: &Transac
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "upsert subscription");
     }
 
-    // tier 只在 Production 生效（沙盒污染防线）且订阅当前有效。
-    if is_active && tx.environment == "Production" {
-        if let Err(e) = set_user_tier(&state.db, &principal.user_id, tier).await {
-            tracing::error!("activate: users.tier update failed: {e}");
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "update tier");
-        }
+    // 不再直写 users.tier —— 交给 entitlement 仲裁层统一裁决：
+    //   tier = max(两条轨上所有未过期订阅的 tier)
+    // 沙盒是否计入权益由库内 entitlement_config.include_iap_sandbox 决定
+    // （默认 false，保持原沙盒污染防线），不再硬编码在代码里。
+    if let Err(e) = recompute_user_tier(&state.db, &principal.user_id).await {
+        tracing::error!("activate: tier 仲裁失败: {e}");
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "recompute tier");
     }
 
     let expires_at = tx
@@ -348,13 +368,15 @@ async fn activate_for_user(state: &AppState, principal: &Principal, tx: &Transac
 // 状态转移落库
 // ============================================================
 
-/// 把状态机决策写入 `iap_subscriptions`，Production 时联动 `users.tier`。
+/// 把状态机决策写入 `iap_subscriptions`，并触发 entitlement 仲裁重算 `users.tier`。
+///
+/// 沙盒是否计入权益不再由本函数的 `is_prod` 判断，统一交给
+/// `v_active_entitlements` 视图里的 `include_iap_sandbox` 配置项。
 async fn apply_transition(
     db: &sea_orm::DatabaseConnection,
     t: &StateTransition,
     tx: &TransactionInfo,
 ) -> Result<(), sea_orm::DbErr> {
-    let is_prod = t.environment == "Production";
     let otid = tx.original_transaction_id.as_str();
 
     let existing = iap_subscriptions::Entity::find()
@@ -415,10 +437,9 @@ async fn apply_transition(
                         .filter(iap_subscriptions::Column::OriginalTransactionId.eq(otid))
                         .exec(db)
                         .await?;
-                    // 实时升降级（借每请求查库的 resolve_principal 生效）。
-                    if is_prod {
-                        set_user_tier(db, &row.user_id, tier).await?;
-                    }
+                    // 交给 entitlement 仲裁层：不再单方面升/降，
+                    // 另一条轨（Stripe）若仍有有效订阅不会被本轨动作抹掉。
+                    recompute_user_tier(db, &row.user_id).await?;
                 }
                 None => {
                     // SUBSCRIBED/DID_RENEW 抢在 verify 之前到达：无 user_id 可绑，
@@ -479,9 +500,9 @@ async fn apply_transition(
                     .filter(iap_subscriptions::Column::OriginalTransactionId.eq(otid))
                     .exec(db)
                     .await?;
-                if is_prod {
-                    set_user_tier(db, &row.user_id, "free").await?;
-                }
+                // IAP 到期：不再无条件降 free —— 若 Stripe 轨仍有有效订阅，
+                // 用户已付的钱不该被本轨动作抹掉。由仲裁层重算。
+                recompute_user_tier(db, &row.user_id).await?;
             }
             Ok(())
         }
@@ -511,10 +532,9 @@ async fn apply_transition(
                     .filter(iap_subscriptions::Column::OriginalTransactionId.eq(otid))
                     .exec(db)
                     .await?;
-                if is_prod {
-                    // 退款/家庭共享撤销：立即降级，防薅关键路径。
-                    set_user_tier(db, &row.user_id, "free").await?;
-                }
+                // 退款/家庭共享撤销：本轨权益立即失效。是否整体降 free 由仲裁层
+                // 决定（另一条轨若仍有有效订阅，按其 tier 保留）。
+                recompute_user_tier(db, &row.user_id).await?;
             }
             Ok(())
         }
@@ -590,32 +610,50 @@ async fn resolve_payer(state: &AppState, headers: &HeaderMap) -> Result<Principa
     resolve_principal_with(state, headers, AuthMode::Required, Provision::NoAutoCreate).await
 }
 
-/// `UPDATE users SET tier = ? WHERE id = ?`（每请求查库 ⇒ 下一请求即生效）。
+/// 调 entitlement 仲裁层重算 `users.tier`。
 ///
-/// P1-1：必须校验 `rows_affected == 1`。0 行意味着 `user_id` 在 `users` 里不存在
-/// （例如误传了 `sha256(sub)` 而不是 `users.id`），旧代码照样回 200 + `"tier":"pro"`，
-/// 于是"买完没生效、日志还干净"。现在 0 行 ⇒ 记 error 并按 DB 错误上抛（→ 500）。
-async fn set_user_tier(
+/// 取代旧的 `set_user_tier()`（`UPDATE users SET tier = ?`）。
+/// 旧写法是 last-write-wins：本轨一动作就覆盖全局 tier，会把另一条轨
+/// （Stripe / Apple IAP）上**仍然有效**的订阅连带抹掉 —— 用户付了钱权益消失。
+///
+/// 新语义（`recompute_user_tier()` SQL 函数 + `v_active_entitlements` 视图）：
+///   tier     = max( 两条轨上所有未过期订阅的 tier )
+///   降级 free = 仅当两条轨都没有有效订阅
+///
+/// 沙盒是否计入权益由库内 `entitlement_config.include_iap_sandbox` 决定
+/// （默认 false），不再硬编码在 Rust 里 —— 联调时改配置即可，不用重新发版。
+///
+/// 另有 `trg_iap_subscriptions_recompute_tier` 触发器兜底：即便某处漏调本函数，
+/// 只要订阅表被写过，tier 也会被重算。
+async fn recompute_user_tier(
     db: &sea_orm::DatabaseConnection,
     user_id: &str,
-    tier: &str,
 ) -> Result<(), sea_orm::DbErr> {
-    let outcome = users::Entity::update_many()
-        .col_expr(users::Column::Tier, Expr::value(tier))
-        .filter(users::Column::Id.eq(user_id))
-        .exec(db)
-        .await?;
+    let stmt = sea_orm::Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "SELECT recompute_user_tier($1)",
+        [user_id.into()],
+    );
 
-    if outcome.rows_affected != 1 {
+    let row = db.query_one(stmt).await?.ok_or_else(|| {
+        tracing::error!(user_id = %user_id, "recompute_user_tier: 数据库未返回任何行");
+        sea_orm::DbErr::RecordNotFound("recompute_user_tier 无返回".into())
+    })?;
+
+    let new_tier: String = row.try_get("", "recompute_user_tier").unwrap_or_default();
+
+    // 0 行更新 = users 里没有这个 id（误传 sha256(sub) / 已删号）。
+    // 旧代码会照样回 200 + "tier":"pro"，导致"买完没生效、日志还干净"。
+    let exists: bool = users::Entity::find_by_id(user_id).one(db).await?.is_some();
+    if !exists {
         tracing::error!(
             user_id = %user_id,
-            tier = %tier,
-            rows_affected = outcome.rows_affected,
-            "set_user_tier: 期望更新 1 行，实际 {} 行 —— user_id 与 users.id 不匹配（孤儿 user_id 或已删号），拒绝按成功返回",
-            outcome.rows_affected
+            "recompute_user_tier: users 里查无此 id —— 疑似误传了 sha256(sub) 而非 users.id，拒绝按成功返回"
         );
         return Err(sea_orm::DbErr::RecordNotUpdated);
     }
+
+    tracing::info!(user_id = %user_id, tier = %new_tier, "entitlement 仲裁完成");
     Ok(())
 }
 
