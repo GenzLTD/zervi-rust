@@ -19,6 +19,21 @@
 --   ⇒ 灌完数据后必须做一次人工校准/views 审计，确认 CN 默认是否与实际相符。
 --   若希望「强制显式」，去掉 DEFAULT 即可（本表当前 0 行，加 NOT NULL 不需 default）。
 --
+-- ⚠️ 前置 1：目标库必须是 **61 表全集**（尤其含 `public.tenants`）
+--   2026-10-24 实测：存在第三种叫 genzltd 的环境——「旧 genzltd 空壳」，
+--   约 50 表、**缺 public.tenants**。在上面跑本脚本会卡在
+--   fk_users_tenant_id（FOREIGN KEY REFERENCES public.tenants）→ relation does not exist。
+--   该失败是 **fail-closed**（整事务回滚，不留半成品），属于好性质，
+--   但容易被误读成「脚本有 bug」。⇒ 跑之前先自检：
+--       SELECT count(*) FROM pg_tables WHERE schemaname='public';        -- 期望 61
+--       SELECT to_regclass('public.tenants') IS NOT NULL;                -- 期望 t
+--
+-- ⚠️ 前置 2：迁移「跑完没报错」不能证明两端同构
+--   同名 CHECK 定义不同时，本脚本 EXIT=0 且零提示地跳过（静默漂移）。
+--   ⇒ 迁移后必须再跑 region_dimension_verify.sql 比对 DIGEST。
+--
+-- ⚠️ 前置 3：PG >= 11（依赖 fast default；低于此版本带数据加 NOT NULL DEFAULT 会重写全表）
+--
 -- 幂等：可重复执行
 -- =====================================================================
 
