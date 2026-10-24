@@ -25,8 +25,14 @@
 --   fk_users_tenant_id（FOREIGN KEY REFERENCES public.tenants）→ relation does not exist。
 --   该失败是 **fail-closed**（整事务回滚，不留半成品），属于好性质，
 --   但容易被误读成「脚本有 bug」。⇒ 跑之前先自检：
---       SELECT count(*) FROM pg_tables WHERE schemaname='public';        -- 期望 61
---       SELECT to_regclass('public.tenants') IS NOT NULL;                -- 期望 t
+--       SELECT count(*) FROM pg_tables WHERE schemaname='public';   -- 全集 59；部署仲裁层后 60
+--       SELECT count(*) FROM pg_tables WHERE schemaname='vec';      -- 另有 2 张，别漏数也别算进 public
+--       SELECT to_regclass('public.tenants') IS NOT NULL;           -- 期望 t
+--
+--   （2026-10-24 华为实测更正：这里原写「public 期望 61」是**错的** ——
+--     61 是 public 59 + vec 2 的**合计**，不是 public 单 schema 的数。
+--     写错的代价：对端照着数会得到 59/60，反过来怀疑自己的库不完整。
+--     这是「文档写错 → 对端误判」的实例，记下来。）
 --
 -- ⚠️ 前置 2：迁移「跑完没报错」不能证明两端同构
 --   同名 CHECK 定义不同时，本脚本 EXIT=0 且零提示地跳过（静默漂移）。
