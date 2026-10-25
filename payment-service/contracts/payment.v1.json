@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Looma Payment Contract v1",
+  "version": "1.3.0",
+  "protocol": "contracts/gfcc",
+  "description": "Tier 全球统一；价格按 region 分叉，商品决定定价。双主体目录：CN=深伯乐（微信、华为 IAP）；US=YeDall（Stripe）。协议真源 contracts/gfcc。商品到档位以本文件 huawei_iap.products 与 apple_iap.products 为准。",
+  "tier_enum": ["free", "supporter", "pro", "enterprise"],
+  "deprecated_tier_aliases": {
+    "basic": "supporter"
+  },
+  "regions": {
+    "CN": {
+      "currency": "CNY",
+      "payment_provider": "wechat",
+      "payment_providers": ["wechat", "huawei_iap"],
+      "default": true,
+      "label": "中国大陆"
+    },
+    "US": {
+      "currency": "USD",
+      "payment_provider": "stripe",
+      "payment_providers": ["stripe", "paypal", "airwallex"],
+      "default": false,
+      "label": "United States"
+    }
+  },
+  "huawei_iap": {
+    "description": "HarmonyOS 元服务 IAP；客户端验签上报后服务端 RSA 验签并发货。未知 product_id 显式失败，不得默认成 supporter。",
+    "products": {
+      "premium_monthly": "supporter",
+      "pro_monthly": "pro",
+      "supporter": "supporter",
+      "pro": "pro"
+    },
+    "endpoints": [
+      {
+        "method": "POST",
+        "path": "/v1/payment/huawei/notify",
+        "auth": "required",
+        "body_camelCase": {
+          "purchaseData": "string JSON",
+          "purchaseSignature": "Base64",
+          "signatureAlgorithm": "SHA256WithRSA (optional)",
+          "expectedProductId": "optional",
+          "expectedAmount": "optional"
+        },
+        "status": "implemented"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/payment/huawei/verify",
+        "auth": "required",
+        "body_camelCase": {
+          "purchaseToken": "string",
+          "productId": "string"
+        },
+        "status": "stub_501"
+      }
+    ],
+    "env": [
+      "HUAWEI_IAP_PUBLIC_KEY",
+      "HUAWEI_IAP_SIGN_ALGORITHM"
+    ]
+  },
+  "apple_iap": {
+    "description": "App Store IAP（自研服务端：zervi-rust payment-service :3009，分支 feat/apple-iap）。仅海外 App Store 上架；App 内 StoreKit 2 交易，非 web checkout 通道——不进 regions.*.payment_providers，web 结账页不展示",
+    "trust_model": "Server Notification V2 + App Store Server API，全链 JWS 验签：pinned Apple Root CA-G3 指纹比对 + leaf←intermediate←root 链验证 + ES256；请求令牌 ES256(.p8) 注入 Bearer",
+    "endpoints": [
+      {
+        "method": "POST",
+        "path": "/v1/payment/apple/webhook",
+        "auth": "apple_jws",
+        "auth_note": "Apple→服务端回调，无用户鉴权；JWS 验签即鉴权。untrusted→401 不落库；幂等键 notification_uuid；状态机错误回 200 防重试风暴",
+        "status": "implemented_in_zervi_rust"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/payment/apple/verify",
+        "auth": "required",
+        "body_camelCase": {
+          "transactionId": "string — StoreKit transaction.id（购买后主动查证，激活主路径）"
+        },
+        "response_camelCase": {
+          "tier": "free|supporter|pro",
+          "active": "boolean",
+          "expiresAt": "RFC3339",
+          "environment": "Sandbox|Production",
+          "originalTransactionId": "string"
+        },
+        "status": "implemented_in_zervi_rust"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/payment/apple/restore",
+        "auth": "required",
+        "body_camelCase": {
+          "originalTransactionId": "string — 跨设备恢复，重新绑定当前账号"
+        },
+        "response_camelCase": "同 verify",
+        "status": "implemented_in_zervi_rust"
+      }
+    ],
+    "products": {
+      "supporter_monthly": "supporter",
+      "pro_monthly": "pro"
+    },
+    "sandbox_rule": "environment=Sandbox 只写 iap_subscriptions（environment 列隔离），绝不触碰 users.tier。",
+    "ledger_rule": "各轨只写自己的订阅行。users.tier 由账本按各轨仍有效的订阅重算，不由单条支付通知 UPDATE users SET tier。",
+    "data_model": "iap_subscriptions（original_transaction_id 锚点，user_id 不唯一支持家庭共享）+ apple_iap_transactions（transaction_id/notification_uuid 双唯一，Apple 重试幂等挡板）",
+    "env": [
+      "APPLE_ISSUER_ID",
+      "APPLE_KEY_ID",
+      "APPLE_BUNDLE_ID",
+      "APPLE_PRIVATE_KEY_PEM",
+      "APPLE_PRIVATE_KEY_PATH",
+      "APPLE_ROOT_CA_PEM",
+      "APPLE_ENV",
+      "PAYMENT_PORT"
+    ]
+  },
+  "plans": [
+    {
+      "tier": "free",
+      "name": {
+        "CN": "免费版",
+        "US": "Free"
+      },
+      "prices": {
+        "CN": {
+          "plan_id": "free_monthly_cn",
+          "amount": 0,
+          "currency": "CNY"
+        },
+        "US": {
+          "plan_id": "free_monthly_us",
+          "amount": 0,
+          "currency": "USD"
+        }
+      },
+      "features": {
+        "CN": [
+          "每日 10 次诗词搜索",
+          "基础诗人浏览",
+          "诗词收藏"
+        ],
+        "US": [
+          "30 AI chats per day",
+          "Basic job matching",
+          "3 resume parses per day"
+        ]
+      },
+      "upgradable": false
+    },
+    {
+      "tier": "supporter",
+      "name": {
+        "CN": "支持者版",
+        "US": "Supporter"
+      },
+      "prices": {
+        "CN": {
+          "plan_id": "supporter_monthly_cn",
+          "amount": 29,
+          "currency": "CNY"
+        },
+        "US": {
+          "plan_id": "supporter_monthly_us",
+          "amount": 1.99,
+          "currency": "USD"
+        }
+      },
+      "features": {
+        "CN": [
+          "无限诗词搜索",
+          "AI 诗词问答",
+          "深度诗人分析",
+          "去广告"
+        ],
+        "US": [
+          "100 AI chats per day",
+          "Advanced job matching",
+          "Unlimited resume parsing",
+          "PlanetX supporter badge"
+        ]
+      },
+      "upgradable": true
+    },
+    {
+      "tier": "pro",
+      "name": {
+        "CN": "专业版",
+        "US": "Pro"
+      },
+      "prices": {
+        "CN": {
+          "plan_id": "pro_monthly_cn",
+          "amount": 99,
+          "currency": "CNY"
+        },
+        "US": {
+          "plan_id": "pro_monthly_us",
+          "amount": 5.99,
+          "currency": "USD"
+        }
+      },
+      "features": {
+        "CN": [
+          "支持者全部功能",
+          "API 调用额度 ×10",
+          "企业级 RAG 知识库",
+          "优先客服支持"
+        ],
+        "US": [
+          "Unlimited AI chats",
+          "Full job matching",
+          "Unlimited resume parsing",
+          "Advanced analytics",
+          "Priority support"
+        ]
+      },
+      "upgradable": true
+    }
+  ],
+  "enterprise": {
+    "tier": "enterprise",
+    "name": {
+      "CN": "企业版",
+      "US": "Enterprise"
+    },
+    "contact_sales": true,
+    "upgradable": false
+  }
+}

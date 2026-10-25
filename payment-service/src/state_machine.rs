@@ -28,6 +28,9 @@
 //! - 时间戳保持 ms（i64），时区/chrono 转换推迟到 v0.4 落库层
 //! - `environment` 一路透传：Sandbox 通知绝不许碰生产权益（v0.4 落库层强制分流）
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crate::jws::{RenewalInfo, TransactionInfo};
 use thiserror::Error;
 
@@ -61,14 +64,34 @@ pub mod sub_status {
     pub const REVOKED: &str = "revoked";
 }
 
-/// 产品 → tier 映射（与 backend/contracts/payment.v1.json 的 plan 命名对齐）。
-/// Apple 后台配置 IAP 商品时应使用同名 product_id。
+/// 产品 → tier。读本 crate 钉住的 `contracts/payment.v1.json` 里
+/// `apple_iap.products`。协议真源是 `contracts/gfcc`；这张表是产品契约，
+/// 须与两边 `backend/contracts/payment.v1.json` 字节相同。
+/// 未知 product_id 返回 None，调用方必须显式失败。
+fn apple_product_tiers() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../contracts/payment.v1.json"
+        ))
+        .expect("payment.v1.json 必须可解析");
+        let products = doc
+            .get("apple_iap")
+            .and_then(|v| v.get("products"))
+            .and_then(|v| v.as_object())
+            .expect("apple_iap.products 必须存在");
+        products
+            .iter()
+            .filter_map(|(product_id, tier)| {
+                tier.as_str().map(|name| (product_id.clone(), name.to_string()))
+            })
+            .collect()
+    })
+}
+
 pub fn tier_for_product(product_id: &str) -> Option<&'static str> {
-    match product_id {
-        "supporter_monthly" => Some("supporter"),
-        "pro_monthly" => Some("pro"),
-        _ => None,
-    }
+    let map: &'static HashMap<String, String> = apple_product_tiers();
+    map.get(product_id).map(String::as_str)
 }
 
 #[derive(Debug, Error)]
@@ -81,7 +104,8 @@ pub enum StateMachineError {
     UnknownProduct(String),
 }
 
-/// 状态机产出的动作。v0.4 落库层据此生成 SQL（含 `UPDATE users SET tier`）。
+/// 状态机产出的动作。落库层据此写本轨 `iap_subscriptions`。
+/// 最终 `users.tier` 由账本按各轨仍有效的订阅重算。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubscriptionAction {
     /// 进入/保持 active。DID_RENEW、UPGRADE 走这条。
@@ -100,7 +124,7 @@ pub enum SubscriptionAction {
     },
     /// 过期降级。reason 为 Apple subtype 留痕。
     Expire { reason: Option<String> },
-    /// 退款/撤销，立即降级（`UPDATE users SET tier='free'`）。
+    /// 退款/撤销。本轨订阅标为 revoked。
     Revoke {
         revocation_reason: Option<String>,
         revocation_date_ms: Option<i64>,
