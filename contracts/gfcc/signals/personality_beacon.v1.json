@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GFCC personality_beacon signal payload v1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "PlanetX assessment fact. Routed to identity port as auxiliary capability_trace. User-action origin only; no raw answers.",
   "source": "planetx",
   "route": "identity",

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GFCC Signal Envelope v1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Machine-to-machine signal entry. Sibling of ask.envelope.v1 (human dialogue). Signals are user-action-generated facts, never AI self-attestation. Does not go through POST /v1/ask, llm slot, or ethos quota.",
   "entry": "POST /v1/signal-ingest",
   "auth": {
@@ -20,7 +20,7 @@
     "properties": {
       "signal_type": {
         "type": "string",
-        "enum": ["consensus_match", "personality_beacon"]
+        "enum": ["consensus_match", "personality_beacon", "value_axis_choice"]
       },
       "user_id_hash": {
         "type": "string",
@@ -45,11 +45,13 @@
   },
   "payload_by_type": {
     "consensus_match": { "$ref": "signals/consensus_match.v1.json" },
-    "personality_beacon": { "$ref": "signals/personality_beacon.v1.json" }
+    "personality_beacon": { "$ref": "signals/personality_beacon.v1.json" },
+    "value_axis_choice": { "$ref": "signals/value_axis_choice.v1.json" }
   },
   "route": {
     "consensus_match": "consensus",
-    "personality_beacon": "identity"
+    "personality_beacon": "identity",
+    "value_axis_choice": "identity"
   },
   "idempotency": {
     "unique_key": ["signal_type", "user_id_hash", "nonce"],
@@ -62,7 +64,8 @@
   },
   "red_lines": [
     "payload carries hash and typed results only; no plaintext email, raw answers, or peer identity",
-    "signal must originate from a real user action (confirm match, finish assessment); never AI self-attestation",
+    "signal must originate from a real user action (confirm match, finish assessment, choose a narrative option); never AI self-attestation",
+    "value_axis_choice carries the option axis and 1–5 points; it must not carry salary_match, location_match, culture_workload_match, or overall",
     "SIGNAL_INGEST_SECRET is not ETHOS_AUTH_SECRET"
   ]
 }

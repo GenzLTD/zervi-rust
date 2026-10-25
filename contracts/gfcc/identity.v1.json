@@ -1,14 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GFCC Identity Port v1 (PPI)",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "port": "identity",
-  "description": "Personal-public identity for 格契. Values, capability trace, commitments, and builder tags. Role = growth stage (能不能); builder_tags = craft (擅长做什么). uid is ethos Principal.sub. Paid tier is quota only.",
+  "description": "Personal-public identity for 格契. Values, capability trace, commitments, builder tags, and human-chosen value axes. Role = growth stage (能不能); builder_tags = craft (擅长做什么). uid is ethos Principal.sub. Paid tier is quota only.",
   "not": [
     "a billing plan",
     "a resume inbox",
     "an MBTI product surface",
-    "self-minted capability"
+    "self-minted capability",
+    "a job-match scorecard"
   ],
   "principal": {
     "uid": "sub",
@@ -124,6 +125,16 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Dual / CoCo record ids that justify the current ladder step. AI observation alone is not enough."
+      },
+      "value_axes": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Cumulative points from signal value_axis_choice only. survival=钱多, freedom=事少, belonging=离家近. Absent until the first human choice. Not a match score. job_match may read this object and must not write it.",
+        "properties": {
+          "survival": { "type": "integer", "minimum": 0 },
+          "freedom": { "type": "integer", "minimum": 0 },
+          "belonging": { "type": "integer", "minimum": 0 }
+        }
       }
     }
   },
@@ -135,16 +146,21 @@
     "upsert_profile": {
       "scope": "identity.write",
       "min_role": "participant",
-      "notes": "Self-write of values/commitments/builder_tags. Role changes go through roles.v1 transitions. Humans do not self-mint capability_trace."
+      "notes": "Self-write of values/commitments/builder_tags. Role changes go through roles.v1 transitions. Humans do not self-mint capability_trace. This operation does not write value_axes."
     },
     "append_trace": {
       "scope": "identity.trace.write",
       "min_role": "system",
-      "notes": "Only evidence-weight sources may mint capability. Auxiliary (job_match/mbti/ai_observed) annotates. contribution.fulfilled is the primary mint path."
+      "notes": "Only evidence-weight sources may mint capability. Auxiliary (job_match/mbti/ai_observed) annotates. contribution.fulfilled is the primary mint path. This operation does not write value_axes."
+    },
+    "apply_value_axis": {
+      "scope": "identity.value_axes.write",
+      "min_role": "system",
+      "notes": "Only signal value_axis_choice may add 1–5 points to the choice's own axis. Domain default axis is not a writer. job_match must not call this."
     }
   },
   "optional_plugins": {
-    "career_trace": "JobFirst resume/job_match may feed capability_trace as auxiliary; they are not identity itself",
+    "career_trace": "JobFirst resume/job_match may feed capability_trace as auxiliary and must read value_axes when present. Job scores stay job-scoped and are not identity itself.",
     "personality": "MBTI-like input may annotate values as auxiliary; not an entry port"
   }
 }

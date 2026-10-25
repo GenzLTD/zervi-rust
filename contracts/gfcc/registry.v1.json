@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GFCC Port Registry v1",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Kernel dispatch depends on these interfaces only. Named services below the default line are optional adapters, unloadable via mode. gfcc is the contract layer; Tatha is one implementation of POST /v1/ask.",
   "kernel": {
     "entry": "POST /v1/ask",
@@ -67,7 +67,10 @@
     "job_match": {
       "mode": "profile.demo",
       "may_feed": "identity.capability_trace",
-      "weight": "auxiliary"
+      "must_read": "identity.value_axes",
+      "must_not_write": ["identity.value_axes", "identity.values"],
+      "weight": "auxiliary",
+      "notes": "When value_axes is present, read survival as 钱多/salary_match, freedom as 事少/culture_workload_match, belonging as 离家近/location_match. The other six sub-scores and overall stay job-scoped. Model scores must not be written back onto the axes."
     },
     "poetry": { "mode": "profile.demo" },
     "credit": { "mode": "profile.demo", "notes": "Must not be a consensus surface." },
