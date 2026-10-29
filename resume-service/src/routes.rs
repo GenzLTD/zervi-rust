@@ -13,6 +13,8 @@
 //! · update 只写正文三字段（title/extracted/markdown），merge 语义，不碰
 //!   visibility / status——visibility 的唯一写入口是 `/permission`，status 由
 //!   入库链路派生，避免未被请求的字段被隐式改写。
+//! · analysis / delete 同属 owner 简历数据面，均持 jobseeker_core 授权闸
+//!   （2026-10-30 收口，对齐 detail/update/permission/blacklist）。
 //!
 //! `/v1/resume/:resume_id/permission`（GET/PUT）是授权面的唯一写入口，写的就是
 //! `metadata.permission = {visibility, grants, updated_at}`——与 detail 读的是同一处，
@@ -667,7 +669,9 @@ async fn analysis_resume(
     headers: HeaderMap,
     Query(q): Query<AnalysisQuery>,
 ) -> Response {
-    let principal = match gate(&state, &headers, AuthMode::Required, None).await {
+    // 契约一致性收口：analysis 读 owner 简历正文（同 detail），须持 jobseeker_core 授权。
+    // 未授权 → 403 consent_required（consent.rs 统一口径，dev 旁路 ZERVI_DEV_BYPASS_CONSENT=1）。
+    let principal = match gate(&state, &headers, AuthMode::Required, Some("jobseeker_core")).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -1143,7 +1147,9 @@ async fn delete_resume(
     headers: HeaderMap,
     Path(resume_id): Path<String>,
 ) -> Response {
-    let principal = match gate(&state, &headers, AuthMode::Required, None).await {
+    // 契约一致性收口：delete 删 owner 简历（破坏性写），须持 jobseeker_core 授权。
+    // 未授权 → 403 consent_required（consent.rs 统一口径，dev 旁路 ZERVI_DEV_BYPASS_CONSENT=1）。
+    let principal = match gate(&state, &headers, AuthMode::Required, Some("jobseeker_core")).await {
         Ok(p) => p,
         Err(r) => return r,
     };
