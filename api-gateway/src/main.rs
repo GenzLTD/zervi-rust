@@ -116,7 +116,7 @@ fn app() -> Router {
         .route("/v1/auth/login", post(local_auth::login))
         .route("/v1/auth/me", get(local_auth::me))
 
-        // ── resume-service · /v1/resume/* (11) ──────────────────────────
+        // ── resume-service · /v1/resume/* (15) ──────────────────────────
         // 静态段优先于 :resume_id（契约 path_design.literal_before_param）：
         // templates / blacklist 必须显式注册，不能落进 :resume_id 通配。
         .route("/v1/resume/parse", any(route_to_resume_service))
@@ -130,6 +130,9 @@ fn app() -> Router {
         .route("/v1/resume/blacklist", any(route_to_resume_service))
         .route("/v1/resume/blacklist/:item_id", any(route_to_resume_service))
         .route("/v1/resume/:resume_id", any(route_to_resume_service))
+        // 两段路径不会被单段 :resume_id 匹配（段数不同），必须显式注册，
+        // 否则 /v1/resume/5/permission 直接落 fallback。
+        .route("/v1/resume/:resume_id/permission", any(route_to_resume_service))
 
         // ── job-service · /v1/jobs/* (9) ────────────────────────────────
         // #12 根路径：looma 侧 strict_slashes=False（/v1/jobs 与 /v1/jobs/ 都收）；
@@ -265,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
     info!("   - /v1/ask                    -> tatha (Python brain, gated)");
     info!("   - /v1/auth/verify            -> token introspection for tatha");
     info!("   - /v1/auth/register|login|me -> local dev auth (ZERVI_DEV_AUTH=1)");
-    info!("   - /v1/resume/*          (11) -> resume-service");
+    info!("   - /v1/resume/*          (15) -> resume-service");
     info!("   - /v1/jobs/*            (9)  -> job-service");
     info!("   - /v1/job-posts*        (5)  -> job-service (双轨 B)");
     info!("   - /v1/application/*     (5)  -> application-service");

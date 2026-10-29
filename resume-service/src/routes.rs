@@ -1,4 +1,4 @@
-//! `/v1/resume/*` 十三个端点。身份、同意、配额、错误体对齐 looma。
+//! `/v1/resume/*` 十五个端点。身份、同意、配额、错误体对齐 looma。
 //! 二进制简历转换（MarkItDown）不在本服务；PDF/DOCX 返回 `convert_failed`。
 //! LLM 走 X1，过滤后无可用 provider 则 `parse_failed` / 分析字段为 null。
 //!
@@ -13,7 +13,10 @@
 //! · update 只写正文三字段（title/extracted/markdown），merge 语义，不碰
 //!   visibility / status——visibility 的唯一写入口是 `/permission`，status 由
 //!   入库链路派生，避免未被请求的字段被隐式改写。
-//!   故 `/permission` PUT 落地时必须写回同一个 `metadata.permission`，否则两处读值分歧。
+//!
+//! `/v1/resume/:resume_id/permission`（GET/PUT）是授权面的唯一写入口，写的就是
+//! `metadata.permission = {visibility, grants, updated_at}`——与 detail 读的是同一处，
+//! 不另建表、不留第二条写路径。grants 为全量替换：PUT 省略 grants 等于清空。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -51,6 +54,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/resume/blacklist/:item_id",
             axum::routing::delete(remove_blacklist),
+        )
+        // 授权面：两段路径，与单段 :resume_id 不冲突；静态段优先于参数段仍成立。
+        .route(
+            "/v1/resume/:resume_id/permission",
+            get(get_permission).put(put_permission),
         )
         // 三条方法共用 :resume_id；静态段已在上方注册，axum 优先精确匹配。
         .route(
@@ -768,6 +776,107 @@ fn detail_json(row: &documents::Model) -> Value {
     body
 }
 
+/// 授权面（`/permission`）的取值域与上限。
+const SUBJECT_TYPES: [&str; 3] = ["user", "enterprise", "share_code_ref"];
+const PERMISSION_SCOPES: [&str; 2] = ["read", "download"];
+const GRANTS_MAX: usize = 200;
+const SUBJECT_ID_MAX_CHARS: usize = 200;
+
+/// 单条 grant 归一化：只保留契约声明的四个键，顺序固定，`expires_at` 缺失补 null。
+/// 返回 Err 用于 400 文案；读路径用 .ok() 过滤脏数据，不因历史脏行把整份授权面打成 500。
+fn normalize_grant(raw: &Value) -> Result<Value, String> {
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| "grants 的每一项必须是对象".to_string())?;
+    let subject_type = obj
+        .get("subject_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !SUBJECT_TYPES.contains(&subject_type) {
+        return Err(format!("subject_type 非法：{subject_type}"));
+    }
+    let subject_id = obj
+        .get("subject_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if subject_id.is_empty() {
+        return Err("subject_id 不能为空".to_string());
+    }
+    if subject_id.chars().count() > SUBJECT_ID_MAX_CHARS {
+        return Err(format!("subject_id 超过 {SUBJECT_ID_MAX_CHARS} 字符"));
+    }
+    let scope = obj.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+    if !PERMISSION_SCOPES.contains(&scope) {
+        return Err(format!("scope 非法：{scope}"));
+    }
+    let expires_at = match obj.get("expires_at") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(s)) => {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| format!("expires_at 不是 RFC3339：{s}"))?;
+            json!(s)
+        }
+        Some(_) => return Err("expires_at 必须是 RFC3339 字符串或 null".to_string()),
+    };
+    Ok(json!({
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "scope": scope,
+        "expires_at": expires_at,
+    }))
+}
+
+/// PUT 的 grants 校验：必须是数组、不超过上限、条目合法、同一 (主语, 权限) 不重复。
+/// 不去重也不静默丢弃——重复条目说明客户端把「全量替换」当增量合并了，直接报错更有用。
+fn parse_grants(raw: &Value) -> Result<Vec<Value>, String> {
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| "grants 必须是数组".to_string())?;
+    if arr.len() > GRANTS_MAX {
+        return Err(format!("grants 超过 {GRANTS_MAX} 条"));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::HashSet::new();
+    for item in arr {
+        let grant = normalize_grant(item)?;
+        let key = format!(
+            "{}|{}|{}",
+            grant["subject_type"].as_str().unwrap_or(""),
+            grant["subject_id"].as_str().unwrap_or(""),
+            grant["scope"].as_str().unwrap_or("")
+        );
+        if !seen.insert(key.clone()) {
+            return Err(format!("grants 存在重复条目：{key}"));
+        }
+        out.push(grant);
+    }
+    Ok(out)
+}
+
+/// GET/PUT 共用响应体：`updated_at` 只有真写过授权面才会出现（契约里它是可选字段）。
+fn permission_json(resume_id: i64, meta: &Value) -> Value {
+    let grants: Vec<Value> = meta
+        .get("permission")
+        .and_then(|p| p.get("grants"))
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|v| normalize_grant(v).ok()).collect())
+        .unwrap_or_default();
+    let mut body = json!({
+        "resume_id": resume_id.to_string(),
+        "visibility": resume_visibility(meta),
+        "grants": grants,
+    });
+    if let Some(ts) = meta
+        .get("permission")
+        .and_then(|p| p.get("updated_at"))
+        .and_then(|v| v.as_str())
+    {
+        body["updated_at"] = json!(ts);
+    }
+    body
+}
+
 /// `:resume_id` 解析失败与「不是本人简历」都回 404：
 /// 不区分「不存在」与「无权限」，避免探测他人简历是否存在。
 fn parse_resume_id(raw: &str) -> Result<i64, Response> {
@@ -900,6 +1009,21 @@ async fn update_resume(
     if let Some(extracted) = &body.extracted {
         meta["extracted"] = extracted.clone();
     }
+    match persist_document(&state, row, meta, next_title, next_size).await {
+        Ok(updated) => Json(detail_json(&updated)).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// 正文与授权面共用同一条写回路径：只改 metadata（+ 可选 title/file_size），
+/// 其余列按原值回写，避免两处各写一套 ActiveModel 后漂移。
+async fn persist_document(
+    state: &AppState,
+    row: documents::Model,
+    meta: Value,
+    next_title: Option<String>,
+    next_size: Option<i32>,
+) -> Result<documents::Model, Response> {
     let active = documents::ActiveModel {
         id: Set(row.id),
         title: Set(next_title.unwrap_or_else(|| row.title.clone())),
@@ -912,9 +1036,105 @@ async fn update_resume(
         created_at: Set(row.created_at),
         processed_at: Set(row.processed_at),
     };
-    match active.update(&state.db).await {
-        Ok(updated) => Json(detail_json(&updated)).into_response(),
-        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", e.to_string()),
+    active
+        .update(&state.db)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", e.to_string()))
+}
+
+/// 仅 owner 可读完整授权面（契约 permission_semantics.note）：
+/// trusted/everyone 访客不走上游端点，走业务读路径按 visibility 过滤。
+async fn get_permission(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(resume_id): Path<String>,
+) -> Response {
+    let principal = match gate(
+        &state,
+        &headers,
+        AuthMode::Required,
+        Some("jobseeker_core"),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let id = match parse_resume_id(&resume_id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match find_owned_resume(&state, &principal.user_id, id).await {
+        Ok(row) => {
+            Json(permission_json(row.id, &parse_meta(row.metadata.as_deref()))).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct PermissionBody {
+    #[serde(default)]
+    visibility: Option<String>,
+    /// 契约 full_replacement：省略 = []（清空授权），不是「保持原值」。
+    /// 客户端必须先 GET 再 PUT，把 PUT 当增量合并会静默清掉既有 grants。
+    #[serde(default)]
+    grants: Option<Value>,
+}
+
+async fn put_permission(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(resume_id): Path<String>,
+    Json(body): Json<PermissionBody>,
+) -> Response {
+    let principal = match gate(
+        &state,
+        &headers,
+        AuthMode::Required,
+        Some("jobseeker_core"),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let visibility = match body.visibility.as_deref() {
+        Some(v) if VISIBILITY_VALUES.contains(&v) => v.to_string(),
+        Some(v) => return fail(StatusCode::BAD_REQUEST, "bad_request", format!("visibility 非法：{v}")),
+        None => return fail(StatusCode::BAD_REQUEST, "bad_request", "visibility 必填"),
+    };
+    let grants = match &body.grants {
+        None => Vec::new(),
+        Some(raw) => match parse_grants(raw) {
+            Ok(g) => g,
+            Err(msg) => return fail(StatusCode::BAD_REQUEST, "bad_request", msg),
+        },
+    };
+    let id = match parse_resume_id(&resume_id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let row = match find_owned_resume(&state, &principal.user_id, id).await {
+        Ok(row) => row,
+        Err(r) => return r,
+    };
+    // 只替换 permission 子树，正文/归属/文件名原样保留（与 update 同一条写回路径）。
+    let mut meta = parse_meta(row.metadata.as_deref());
+    meta["permission"] = json!({
+        "visibility": visibility,
+        "grants": grants,
+        // 服务端生成；客户端传入一律忽略（契约 write_semantics.updated_at）
+        "updated_at": now_tz().to_rfc3339(),
+    });
+    let next_size = row.file_size;
+    match persist_document(&state, row, meta, None, next_size).await {
+        Ok(updated) => Json(permission_json(
+            updated.id,
+            &parse_meta(updated.metadata.as_deref()),
+        ))
+        .into_response(),
+        Err(r) => r,
     }
 }
 
@@ -1045,8 +1265,13 @@ async fn analyze(state: &AppState, doc_type: &str, text: &str) -> Result<Value, 
 }
 
 fn parse_meta(raw: Option<&str>) -> Value {
-    raw.and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}))
+    // 只接受 JSON 对象：后面所有写回都是 meta["xxx"] = ... 的下标赋值，
+    // 非对象（null / 数组 / 字符串）会让下标赋值 panic，这里统一归一为 {}。
+    let parsed = raw.and_then(|s| serde_json::from_str::<Value>(s).ok());
+    match parsed {
+        Some(v) if v.is_object() => v,
+        _ => json!({}),
+    }
 }
 
 fn parse_json_block(raw: &str) -> Option<Value> {
