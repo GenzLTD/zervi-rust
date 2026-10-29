@@ -1,6 +1,10 @@
-//! `/v1/resume/*` 七个端点。身份、同意、配额、错误体对齐 looma。
+//! `/v1/resume/*` 八个端点。身份、同意、配额、错误体对齐 looma。
 //! 二进制简历转换（MarkItDown）不在本服务；PDF/DOCX 返回 `convert_failed`。
 //! LLM 走 X1，过滤后无可用 provider 则 `parse_failed` / 分析字段为 null。
+//!
+//! 契约：looma-zervi backend/contracts/resume.v1.json v0.1.0。
+//! templates 为全局只读目录（auth: optional，无 consent，非用户资源）——
+//! 0.1 不提供写操作；用户自建模板须另开 /v1/resume/templates/custom 并升 minor。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -28,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resume/ingest", post(ingest_resume))
         .route("/v1/resume/improve", post(improve_resume))
         .route("/v1/resume/list", get(list_resumes))
+        .route("/v1/resume/templates", get(list_templates))
         .route("/v1/resume/analysis", get(analysis_resume))
         .route("/v1/resume/:resume_id", axum::routing::delete(delete_resume))
         .with_state(state)
@@ -279,6 +284,75 @@ async fn list_resumes(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .collect();
     let total = resumes.len();
     Json(json!({ "resumes": resumes, "total": total })).into_response()
+}
+
+/// 全局模板目录（resume.v1.json v0.1.0 · templates_list）。
+///
+/// 静态目录，非用户资源，不入库：0.1 只读且无个性化排序。
+/// `preview_fields` 取值对齐 ParsedResume 字段名（name/education/experience/skills/expectation）。
+/// 若未来按 identity.value_axes 排序推荐，另在 gfcc 声明 optional adapter（must_not_write）。
+async fn list_templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // 契约 auth: optional、无 consent：游客可浏览目录，登录不写库、不建 users 行
+    // （Auto 建档对目录浏览没有意义，但保持与 upload/ingest 同一入口语义最简单）。
+    if let Err(r) = gate(&state, &headers, AuthMode::Optional, None).await {
+        return r;
+    }
+    let templates = template_catalog();
+    let total = templates.len();
+    Json(json!({ "templates": templates, "total": total })).into_response()
+}
+
+fn template_catalog() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "standard-zh",
+            "name": "标准求职版",
+            "locale": "zh-CN",
+            "summary": "信息完整、结构均衡，适合大多数社招投递场景。",
+            "tags": ["通用", "社招"],
+            "preview_fields": ["name", "education", "experience", "skills", "expectation"],
+        }),
+        json!({
+            "id": "tech-zh",
+            "name": "技术专员版",
+            "locale": "zh-CN",
+            "summary": "突出技能栈与项目亮点，弱化时间线，适合技术岗。",
+            "tags": ["技术", "项目导向"],
+            "preview_fields": ["name", "skills", "experience", "expectation"],
+        }),
+        json!({
+            "id": "fresh-zh",
+            "name": "应届生版",
+            "locale": "zh-CN",
+            "summary": "教育背景前置，突出校园经历与实习成果。",
+            "tags": ["应届", "校招"],
+            "preview_fields": ["name", "education", "experience", "skills"],
+        }),
+        json!({
+            "id": "onepage-zh",
+            "name": "简约一页版",
+            "locale": "zh-CN",
+            "summary": "一页纸原则，只留最强信号，适合快速筛选场景。",
+            "tags": ["一页", "高效"],
+            "preview_fields": ["name", "experience", "skills", "expectation"],
+        }),
+        json!({
+            "id": "standard-en",
+            "name": "Standard Professional",
+            "locale": "en-US",
+            "summary": "Balanced structure for general job applications.",
+            "tags": ["general"],
+            "preview_fields": ["name", "education", "experience", "skills", "expectation"],
+        }),
+        json!({
+            "id": "tech-en",
+            "name": "Engineering Focused",
+            "locale": "en-US",
+            "summary": "Skills-first layout highlighting projects and impact.",
+            "tags": ["engineering"],
+            "preview_fields": ["name", "skills", "experience", "expectation"],
+        }),
+    ]
 }
 
 #[derive(Deserialize)]
