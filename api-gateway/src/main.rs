@@ -116,9 +116,9 @@ fn app() -> Router {
         .route("/v1/auth/login", post(local_auth::login))
         .route("/v1/auth/me", get(local_auth::me))
 
-        // ── resume-service · /v1/resume/* (8) ───────────────────────────
+        // ── resume-service · /v1/resume/* (11) ──────────────────────────
         // 静态段优先于 :resume_id（契约 path_design.literal_before_param）：
-        // templates 必须显式注册，不能落进 :resume_id 通配。
+        // templates / blacklist 必须显式注册，不能落进 :resume_id 通配。
         .route("/v1/resume/parse", any(route_to_resume_service))
         .route("/v1/resume/upload", any(route_to_resume_service))
         .route("/v1/resume/ingest", any(route_to_resume_service))
@@ -126,6 +126,9 @@ fn app() -> Router {
         .route("/v1/resume/list", any(route_to_resume_service))
         .route("/v1/resume/templates", any(route_to_resume_service))
         .route("/v1/resume/analysis", any(route_to_resume_service))
+        // 屏蔽企业三条：GET/POST 同段 + DELETE 子段（:item_id 与 :resume_id 不同层级，不冲突）
+        .route("/v1/resume/blacklist", any(route_to_resume_service))
+        .route("/v1/resume/blacklist/:item_id", any(route_to_resume_service))
         .route("/v1/resume/:resume_id", any(route_to_resume_service))
 
         // ── job-service · /v1/jobs/* (9) ────────────────────────────────
@@ -262,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     info!("   - /v1/ask                    -> tatha (Python brain, gated)");
     info!("   - /v1/auth/verify            -> token introspection for tatha");
     info!("   - /v1/auth/register|login|me -> local dev auth (ZERVI_DEV_AUTH=1)");
-    info!("   - /v1/resume/*          (8)  -> resume-service");
+    info!("   - /v1/resume/*          (11) -> resume-service");
     info!("   - /v1/jobs/*            (9)  -> job-service");
     info!("   - /v1/job-posts*        (5)  -> job-service (双轨 B)");
     info!("   - /v1/application/*     (5)  -> application-service");
