@@ -40,6 +40,7 @@ pub use super::query_logs::Entity as QueryLogs;
 pub use super::quiz_sessions::Entity as QuizSessions;
 pub use super::quota_records::Entity as QuotaRecords;
 pub use super::report_sharing::Entity as ReportSharing;
+pub use super::resume_blacklist::Entity as ResumeBlacklist;
 pub use super::sales_inquiries::Entity as SalesInquiries;
 pub use super::share_codes::Entity as ShareCodes;
 pub use super::signal_ingest::Entity as SignalIngest;

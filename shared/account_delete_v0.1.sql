@@ -18,6 +18,9 @@
 -- 不在本文件内、但删号必须一起做的两件事：
 --   · Supabase Auth 侧删除 auth.users（调 Admin API，SQL 做不到）
 --   · 客户端 token 吊销（否则已签发的 JWT 在过期前仍可用）
+--
+-- 前置：policy 里的表名必须都真实存在（EXECUTE 不支持缺表），
+--       所以 resume_blacklist_v0.1.sql 这类新增表 DDL 要先于本文件执行。
 -- ============================================================
 
 -- ------------------------------------------------------------
@@ -50,6 +53,10 @@ AS $fn$
     ('challenge_entries',       'user_id',        'D'),
     ('mission_completions',     'user_id',        'D'),
     ('game_profiles',           'user_id',        'D'),
+    -- 简历域屏蔽企业（shared/resume_blacklist_v0.1.sql）。该表对 users 是 ON DELETE CASCADE，
+    -- 即便漏跑本行，删 users 时也不会报外键违例；列入 policy 是为了 preview 能看见行数、
+    -- 且 behavior 与其他用户数据一致（先删行，再删 users）。
+    ('resume_blacklist',        'user_id',        'D'),
 
     -- 企业侧
     ('job_posts',               'user_id',        'D'),

@@ -42,6 +42,7 @@ pub mod query_logs;
 pub mod quiz_sessions;
 pub mod quota_records;
 pub mod report_sharing;
+pub mod resume_blacklist;
 pub mod sales_inquiries;
 pub mod share_codes;
 pub mod signal_ingest;

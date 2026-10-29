@@ -1,10 +1,12 @@
-//! `/v1/resume/*` 八个端点。身份、同意、配额、错误体对齐 looma。
+//! `/v1/resume/*` 十一个端点。身份、同意、配额、错误体对齐 looma。
 //! 二进制简历转换（MarkItDown）不在本服务；PDF/DOCX 返回 `convert_failed`。
 //! LLM 走 X1，过滤后无可用 provider 则 `parse_failed` / 分析字段为 null。
 //!
 //! 契约：looma-zervi backend/contracts/resume.v1.json v0.1.0。
 //! templates 为全局只读目录（auth: optional，无 consent，非用户资源）——
 //! 0.1 不提供写操作；用户自建模板须另开 /v1/resume/templates/custom 并升 minor。
+//! blacklist 为用户维屏蔽规则集（auth: required + jobseeker_core，落 resume_blacklist
+//! 表，非 documents；不占文档配额，随 users 级联删除）。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -13,14 +15,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use common::entities::documents;
+use common::entities::{documents, enterprises, resume_blacklist};
 use common::looma::{
     consume_daily, fail, now_tz, require_consent, resolve_principal, AppState,
     AuthMode, Principal, Resource,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,6 +36,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resume/list", get(list_resumes))
         .route("/v1/resume/templates", get(list_templates))
         .route("/v1/resume/analysis", get(analysis_resume))
+        // 用户维屏蔽企业：静态段 blacklist 必须在 :resume_id 之前（契约 path_design.literal_before_param）
+        .route(
+            "/v1/resume/blacklist",
+            get(list_blacklist).post(add_blacklist),
+        )
+        .route(
+            "/v1/resume/blacklist/:item_id",
+            axum::routing::delete(remove_blacklist),
+        )
         .route("/v1/resume/:resume_id", axum::routing::delete(delete_resume))
         .with_state(state)
 }
@@ -353,6 +364,275 @@ fn template_catalog() -> Vec<Value> {
             "preview_fields": ["name", "skills", "experience", "expectation"],
         }),
     ]
+}
+
+// ── 屏蔽企业（用户维，非简历资源）──────────────────────────────────────
+//
+// 契约：blacklist_list / blacklist_add / blacklist_remove，dimension=user。
+// 表：resume_blacklist（shared/resume_blacklist_v0.1.sql）。
+// 与 documents 解耦：屏蔽是「匹配规则集」，命中即从推荐/投递侧过滤，
+// 不占 ResumeParse 配额（Resource 只有 ResumeParse），随 users 级联删除。
+
+const BLACKLIST_MATCHES: [&str; 3] = ["exact_name", "credit_code", "enterprise_id"];
+/// 0.1 不分页（契约无 cursor）；上限兜底防单用户堆积，total 仍报真实总数。
+const BLACKLIST_LIST_LIMIT: u64 = 500;
+
+fn blacklist_item_json(row: &resume_blacklist::Model) -> Value {
+    let mut item = json!({
+        "id": row.id,
+        "company_name": row.company_name,
+        "match": row.match_kind,
+        "created_at": row.created_at.to_rfc3339(),
+    });
+    // 可选字段只在有值时出现：契约里它们是 type:string（不是 string|null），
+    // 塞 null 会被严格校验器判违约。
+    if let Some(v) = &row.credit_code {
+        item["credit_code"] = json!(v);
+    }
+    if let Some(v) = &row.enterprise_id {
+        item["enterprise_id"] = json!(v);
+    }
+    if let Some(v) = &row.note {
+        item["note"] = json!(v);
+    }
+    item
+}
+
+async fn list_blacklist(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match gate(&state, &headers, AuthMode::Required, Some("jobseeker_core")).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let total = match resume_blacklist::Entity::find()
+        .filter(resume_blacklist::Column::UserId.eq(principal.user_id.clone()))
+        .count(&state.db)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                format!("读取屏蔽列表失败: {e}"),
+            )
+        }
+    };
+    let rows = match resume_blacklist::Entity::find()
+        .filter(resume_blacklist::Column::UserId.eq(principal.user_id.clone()))
+        .order_by_desc(resume_blacklist::Column::CreatedAt)
+        .limit(BLACKLIST_LIST_LIMIT)
+        .all(&state.db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                format!("读取屏蔽列表失败: {e}"),
+            )
+        }
+    };
+    Json(json!({
+        "items": rows.iter().map(blacklist_item_json).collect::<Vec<_>>(),
+        "total": total,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct BlacklistAddBody {
+    /// 契约字段名 `match`（Rust 关键字，故字段叫 match_kind）。
+    #[serde(rename = "match", default)]
+    match_kind: String,
+    #[serde(default)]
+    company_name: String,
+    #[serde(default)]
+    credit_code: String,
+    #[serde(default)]
+    enterprise_id: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn add_blacklist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BlacklistAddBody>,
+) -> Response {
+    let principal = match gate(&state, &headers, AuthMode::Required, Some("jobseeker_core")).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+
+    let match_kind = body.match_kind.trim().to_lowercase();
+    if !BLACKLIST_MATCHES.contains(&match_kind.as_str()) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "match 非法：{}（只接受 exact_name|credit_code|enterprise_id）",
+                body.match_kind
+            ),
+        );
+    }
+    let mut company_name = body.company_name.trim().to_string();
+    // 统一社会信用代码入库前归一为大写：唯一索引按 upper() 建表达式，
+    // 不对齐的话同码大小写两版会各插一条。
+    let credit_code = body.credit_code.trim().to_uppercase();
+    let enterprise_id = body.enterprise_id.trim().to_string();
+
+    // 分情况必填（契约 body）。DB 的 CHECK 是第二道闸，这里先给可读的 400。
+    let missing = match match_kind.as_str() {
+        "exact_name" if company_name.is_empty() => Some("match=exact_name 需提供 company_name"),
+        "credit_code" if credit_code.is_empty() => Some("match=credit_code 需提供 credit_code"),
+        "enterprise_id" if enterprise_id.is_empty() => {
+            Some("match=enterprise_id 需提供 enterprise_id")
+        }
+        _ => None,
+    };
+    if let Some(msg) = missing {
+        return fail(StatusCode::BAD_REQUEST, "bad_request", msg);
+    }
+
+    // 只写与 match 对应的那一列，其余置空：三条部分唯一索引按维度分桶，
+    // 多留一列会让「同名但不同维度」的语义变糊。
+    let (credit_code_db, enterprise_id_db) = match match_kind.as_str() {
+        "credit_code" => (Some(credit_code.clone()), None),
+        "enterprise_id" => (None, Some(enterprise_id.clone())),
+        _ => (None, None),
+    };
+
+    // 客户端在非 exact_name 形态下只传匹配键（见 miniprogram blacklist 页），
+    // company_name 缺省时 best-effort 从 enterprises 补展示名；补不到就留空串。
+    if company_name.is_empty() && match_kind == "enterprise_id" {
+        if let Ok(Some(ent)) = enterprises::Entity::find_by_id(enterprise_id.clone())
+            .one(&state.db)
+            .await
+        {
+            company_name = ent.name;
+        }
+    }
+
+    // 幂等添加：同用户 + 同维度 + 同取值已存在就回既有行（200），
+    // 前端「添加 → 重拉列表」不需要区分 409；并发由唯一索引兜底（撞了回查）。
+    if let Some(existing) = find_blacklist_duplicate(
+        &state,
+        &principal,
+        &match_kind,
+        &company_name,
+        &credit_code,
+        &enterprise_id,
+    )
+    .await
+    {
+        return Json(blacklist_item_json(&existing)).into_response();
+    }
+
+    let note = body.note.trim().to_string();
+    let model = resume_blacklist::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        user_id: Set(principal.user_id.clone()),
+        match_kind: Set(match_kind.clone()),
+        company_name: Set(company_name.clone()),
+        credit_code: Set(credit_code_db),
+        enterprise_id: Set(enterprise_id_db),
+        note: Set(if note.is_empty() { None } else { Some(note) }),
+        // DB DEFAULT now()：NotSet 不进 INSERT 列清单
+        created_at: sea_orm::ActiveValue::NotSet,
+    };
+    match model.insert(&state.db).await {
+        Ok(row) => Json(blacklist_item_json(&row)).into_response(),
+        Err(e) => {
+            // 唯一索引竞态（另一请求刚插了同一条）→ 回查后按幂等返回
+            if let Some(existing) = find_blacklist_duplicate(
+                &state,
+                &principal,
+                &match_kind,
+                &company_name,
+                &credit_code,
+                &enterprise_id,
+            )
+            .await
+            {
+                return Json(blacklist_item_json(&existing)).into_response();
+            }
+            fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                format!("写入屏蔽列表失败: {e}"),
+            )
+        }
+    }
+}
+
+async fn remove_blacklist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+) -> Response {
+    let principal = match gate(&state, &headers, AuthMode::Required, Some("jobseeker_core")).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let id = item_id.trim();
+    if id.is_empty() {
+        return fail(StatusCode::BAD_REQUEST, "bad_request", "item_id required");
+    }
+    // 双条件删除：id 命中但 user_id 不符一律走 404，
+    // 不暴露「这条 id 存在、只是不属于你」。
+    match resume_blacklist::Entity::delete_many()
+        .filter(resume_blacklist::Column::Id.eq(id))
+        .filter(resume_blacklist::Column::UserId.eq(principal.user_id.clone()))
+        .exec(&state.db)
+        .await
+    {
+        Ok(res) if res.rows_affected > 0 => {
+            Json(json!({ "message": "removed", "id": id })).into_response()
+        }
+        Ok(_) => fail(StatusCode::NOT_FOUND, "not_found", "屏蔽项不存在"),
+        Err(e) => fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            format!("删除屏蔽项失败: {e}"),
+        ),
+    }
+}
+
+/// 查重：与 DDL 的三条部分唯一索引同口径（名称 lower+btrim、信用代码 upper+btrim、企业 ID btrim）。
+/// 应用层先查只为「幂等返回既有行」，最终裁决仍在索引。
+async fn find_blacklist_duplicate(
+    state: &AppState,
+    principal: &Principal,
+    match_kind: &str,
+    company_name: &str,
+    credit_code: &str,
+    enterprise_id: &str,
+) -> Option<resume_blacklist::Model> {
+    use sea_orm::sea_query::Expr;
+    let mut cond = Condition::all()
+        .add(resume_blacklist::Column::UserId.eq(&principal.user_id))
+        .add(resume_blacklist::Column::MatchKind.eq(match_kind));
+    cond = match match_kind {
+        "credit_code" => cond.add(Expr::cust_with_values(
+            "upper(btrim(credit_code)) = upper(btrim($1))",
+            [credit_code.to_string()],
+        )),
+        "enterprise_id" => cond.add(Expr::cust_with_values(
+            "btrim(enterprise_id) = btrim($1)",
+            [enterprise_id.to_string()],
+        )),
+        _ => cond.add(Expr::cust_with_values(
+            "lower(btrim(company_name)) = lower(btrim($1))",
+            [company_name.to_string()],
+        )),
+    };
+    resume_blacklist::Entity::find()
+        .filter(cond)
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[derive(Deserialize)]
