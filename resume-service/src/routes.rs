@@ -19,6 +19,8 @@
 //! `/v1/resume/:resume_id/permission`（GET/PUT）是授权面的唯一写入口，写的就是
 //! `metadata.permission = {visibility, grants, updated_at}`——与 detail 读的是同一处，
 //! 不另建表、不留第二条写路径。grants 为全量替换：PUT 省略 grants 等于清空。
+//! expires_at 语义（2026-10-30）：过期的 grant 读响应不返回、业务判定按无授权处理；
+//! GET 读到过期条目就地剔除回写、PUT 写前剔除（惰性清理），全表清扫留给后续后台任务。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -881,6 +883,38 @@ fn permission_json(resume_id: i64, meta: &Value) -> Value {
     body
 }
 
+/// 过期 grant 判定：expires_at 非空且 <= now → 过期。
+/// 缺失/null 解析不出 → 未过期（读路径对历史脏行不放大成错误，与 normalize_grant .ok() 口径一致）。
+fn grant_expired(grant: &Value, now: chrono::DateTime<chrono::FixedOffset>) -> bool {
+    grant
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|exp| exp <= now)
+        .unwrap_or(false)
+}
+
+/// 从 metadata.permission.grants 拆（未过期, 已过期）。
+/// 归一化失败的脏行：不进 live 也不进 expired（permission_json 同口径直接过滤掉）。
+fn partition_grants(meta: &Value, now: chrono::DateTime<chrono::FixedOffset>) -> (Vec<Value>, Vec<Value>) {
+    let mut live = Vec::new();
+    let mut expired = Vec::new();
+    let grants = meta
+        .get("permission")
+        .and_then(|p| p.get("grants"))
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|v| normalize_grant(v).ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for g in grants {
+        if grant_expired(&g, now) {
+            expired.push(g);
+        } else {
+            live.push(g);
+        }
+    }
+    (live, expired)
+}
+
 /// `:resume_id` 解析失败与「不是本人简历」都回 404：
 /// 不区分「不存在」与「无权限」，避免探测他人简历是否存在。
 fn parse_resume_id(raw: &str) -> Result<i64, Response> {
@@ -1070,7 +1104,24 @@ async fn get_permission(
     };
     match find_owned_resume(&state, &principal.user_id, id).await {
         Ok(row) => {
-            Json(permission_json(row.id, &parse_meta(row.metadata.as_deref()))).into_response()
+            let mut meta = parse_meta(row.metadata.as_deref());
+            let (live, expired) = partition_grants(&meta, now_tz());
+            if expired.is_empty() {
+                return Json(permission_json(row.id, &meta)).into_response();
+            }
+            // 惰性清理：读到过期条目就地剔除并回写。授权面确被本请求改写，
+            // updated_at 服务端重置（契约 write_semantics.updated_at 同口径）。
+            let next_size = row.file_size;
+            meta["permission"]["grants"] = json!(live);
+            meta["permission"]["updated_at"] = json!(now_tz().to_rfc3339());
+            match persist_document(&state, row, meta, None, next_size).await {
+                Ok(updated) => Json(permission_json(
+                    updated.id,
+                    &parse_meta(updated.metadata.as_deref()),
+                ))
+                .into_response(),
+                Err(r) => r,
+            }
         }
         Err(r) => r,
     }
@@ -1115,6 +1166,10 @@ async fn put_permission(
             Err(msg) => return fail(StatusCode::BAD_REQUEST, "bad_request", msg),
         },
     };
+    // 写前惰性清理：校验（含去重）后剔除已过期条目，不让过期授权借 PUT 复活。
+    // 归一化在 parse_grants 已做，这里只按 expires_at 过滤。
+    let now = now_tz();
+    let grants: Vec<Value> = grants.into_iter().filter(|g| !grant_expired(g, now)).collect();
     let id = match parse_resume_id(&resume_id) {
         Ok(id) => id,
         Err(r) => return r,
