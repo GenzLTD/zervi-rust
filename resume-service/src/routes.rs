@@ -1,4 +1,4 @@
-//! `/v1/resume/*` 十一个端点。身份、同意、配额、错误体对齐 looma。
+//! `/v1/resume/*` 十三个端点。身份、同意、配额、错误体对齐 looma。
 //! 二进制简历转换（MarkItDown）不在本服务；PDF/DOCX 返回 `convert_failed`。
 //! LLM 走 X1，过滤后无可用 provider 则 `parse_failed` / 分析字段为 null。
 //!
@@ -7,6 +7,13 @@
 //! 0.1 不提供写操作；用户自建模板须另开 /v1/resume/templates/custom 并升 minor。
 //! blacklist 为用户维屏蔽规则集（auth: required + jobseeker_core，落 resume_blacklist
 //! 表，非 documents；不占文档配额，随 users 级联删除）。
+//!
+//! detail/update 共用一个 `:resume_id` 路径（GET/PUT/DELETE 三种方法）：
+//! · detail 只读，visibility 从 `metadata.permission.visibility` 读（缺省 private）；
+//! · update 只写正文三字段（title/extracted/markdown），merge 语义，不碰
+//!   visibility / status——visibility 的唯一写入口是 `/permission`，status 由
+//!   入库链路派生，避免未被请求的字段被隐式改写。
+//!   故 `/permission` PUT 落地时必须写回同一个 `metadata.permission`，否则两处读值分歧。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -45,7 +52,13 @@ pub fn router(state: AppState) -> Router {
             "/v1/resume/blacklist/:item_id",
             axum::routing::delete(remove_blacklist),
         )
-        .route("/v1/resume/:resume_id", axum::routing::delete(delete_resume))
+        // 三条方法共用 :resume_id；静态段已在上方注册，axum 优先精确匹配。
+        .route(
+            "/v1/resume/:resume_id",
+            get(detail_resume)
+                .put(update_resume)
+                .delete(delete_resume),
+        )
         .with_state(state)
 }
 
@@ -688,6 +701,221 @@ async fn analysis_resume(
         "analysis": analysis,
     }))
     .into_response()
+}
+
+/// visibility 的合法取值（契约 enums.ResumeVisibility）。
+const VISIBILITY_VALUES: [&str; 3] = ["everyone", "trusted", "private"];
+
+/// 契约里 detail.status 只允许 uploaded/processed/partial。
+/// documents.status 是自由文本，未知值一律按 uploaded 呈现，避免客户端拿到枚举外的值。
+fn resume_status(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("processed") => "processed",
+        Some("partial") => "partial",
+        _ => "uploaded",
+    }
+}
+
+/// 未设置权限时回落 private：最小权限，避免默认把简历暴露给 trusted/everyone。
+fn resume_visibility(meta: &Value) -> String {
+    match meta
+        .get("permission")
+        .and_then(|p| p.get("visibility"))
+        .and_then(|v| v.as_str())
+    {
+        Some(v) if VISIBILITY_VALUES.contains(&v) => v.to_string(),
+        _ => "private".to_string(),
+    }
+}
+
+/// detail 与 update 共用同一份响应体，保证两个端点字段口径一致。
+fn detail_json(row: &documents::Model) -> Value {
+    let meta = parse_meta(row.metadata.as_deref());
+    let meta_filename = meta
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let filename = if !meta_filename.is_empty() {
+        meta_filename.clone()
+    } else if !row.title.is_empty() {
+        row.title.clone()
+    } else {
+        row.file_path.clone()
+    };
+    let title = if !row.title.is_empty() {
+        row.title.clone()
+    } else if !meta_filename.is_empty() {
+        meta_filename
+    } else {
+        "未命名简历".to_string()
+    };
+    let mut body = json!({
+        "id": row.id.to_string(),
+        "title": title,
+        "filename": filename,
+        "uploaded_at": row.created_at.to_rfc3339(),
+        "extracted": meta.get("extracted").cloned().unwrap_or(json!({})),
+        "markdown": meta.get("markdown").and_then(|v| v.as_str()).unwrap_or(""),
+        "visibility": resume_visibility(&meta),
+        "status": resume_status(row.status.as_deref()),
+    });
+    // 契约里 file_size 是 integer（非 null）；没有就省略，不塞 null。
+    if let Some(size) = row.file_size {
+        body["file_size"] = json!(size);
+    }
+    body
+}
+
+/// `:resume_id` 解析失败与「不是本人简历」都回 404：
+/// 不区分「不存在」与「无权限」，避免探测他人简历是否存在。
+fn parse_resume_id(raw: &str) -> Result<i64, Response> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| fail(StatusCode::NOT_FOUND, "not_found", "简历不存在"))
+}
+
+async fn find_owned_resume(
+    state: &AppState,
+    user_id: &str,
+    id: i64,
+) -> Result<documents::Model, Response> {
+    documents::Entity::find_by_id(id)
+        .filter(owner_filter(user_id))
+        .one(&state.db)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "简历不存在"))
+}
+
+async fn detail_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(resume_id): Path<String>,
+) -> Response {
+    let principal = match gate(
+        &state,
+        &headers,
+        AuthMode::Required,
+        Some("jobseeker_core"),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let id = match parse_resume_id(&resume_id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match find_owned_resume(&state, &principal.user_id, id).await {
+        Ok(row) => Json(detail_json(&row)).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// PUT body：三个字段全可选。`Option<T>` 下显式 null 与「未传」等价，
+/// 因此无法用 null 清空字段——契约里这三个字段都是必填型 string/object，本就不该被清空。
+#[derive(Deserialize)]
+struct UpdateBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    extracted: Option<Value>,
+    #[serde(default)]
+    markdown: Option<String>,
+}
+
+const TITLE_MAX_CHARS: usize = 200;
+
+async fn update_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(resume_id): Path<String>,
+    Json(body): Json<UpdateBody>,
+) -> Response {
+    let principal = match gate(
+        &state,
+        &headers,
+        AuthMode::Required,
+        Some("jobseeker_core"),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if body.title.is_none() && body.extracted.is_none() && body.markdown.is_none() {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "至少提供 title / extracted / markdown 之一",
+        );
+    }
+    let next_title = match body.title {
+        Some(raw) => {
+            let t = raw.trim().to_string();
+            if t.is_empty() {
+                return fail(StatusCode::BAD_REQUEST, "bad_request", "title 不能为空");
+            }
+            if t.chars().count() > TITLE_MAX_CHARS {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    format!("title 超过 {TITLE_MAX_CHARS} 字符"),
+                );
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    if let Some(v) = &body.extracted {
+        if !v.is_object() {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "extracted 必须是对象",
+            );
+        }
+    }
+    let id = match parse_resume_id(&resume_id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let row = match find_owned_resume(&state, &principal.user_id, id).await {
+        Ok(row) => row,
+        Err(r) => return r,
+    };
+    // merge 而不是重建：metadata 里还压着 user_id（owner 归属）与 filename，
+    // 整体覆盖会直接让这份简历失去归属、从 list/detail 里消失。
+    let mut meta = parse_meta(row.metadata.as_deref());
+    let mut next_size = row.file_size;
+    if let Some(markdown) = &body.markdown {
+        meta["markdown"] = json!(markdown);
+        // 入库时 file_size 记的就是 markdown 字节长（见 insert_resume），
+        // 正文改写后同步，否则 list 里的体积会一直是旧值。
+        next_size = Some(markdown.len() as i32);
+    }
+    if let Some(extracted) = &body.extracted {
+        meta["extracted"] = extracted.clone();
+    }
+    let active = documents::ActiveModel {
+        id: Set(row.id),
+        title: Set(next_title.unwrap_or_else(|| row.title.clone())),
+        file_path: Set(row.file_path.clone()),
+        doc_type: Set(row.doc_type.clone()),
+        file_size: Set(next_size),
+        metadata: Set(Some(meta.to_string())),
+        status: Set(row.status.clone()),
+        chunk_count: Set(row.chunk_count),
+        created_at: Set(row.created_at),
+        processed_at: Set(row.processed_at),
+    };
+    match active.update(&state.db).await {
+        Ok(updated) => Json(detail_json(&updated)).into_response(),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", e.to_string()),
+    }
 }
 
 async fn delete_resume(
