@@ -1,4 +1,5 @@
 mod routes;
+mod sweep;
 
 use common::looma::AppState;
 use std::net::SocketAddr;
@@ -14,6 +15,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let state = AppState::connect().await?;
+    // 过期 grant 的全表清扫（契约划归后台，端点只有惰性清理）。
+    // 默认开、启动即跑一轮；RESUME_SWEEP_INTERVAL_SECS=0 关闭。
+    sweep::spawn(state.clone());
     let port: u16 = std::env::var("RESUME_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
