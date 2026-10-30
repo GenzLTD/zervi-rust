@@ -14,6 +14,10 @@
 //! 脏值不可能炸查询），过期判定全在 Rust；粗筛命中但 `expired.is_empty()` 的行直接
 //! 跳过、不产生 UPDATE——包括「刚被 GET 惰性清掉」的并发行。
 //!
+//! 一轮扫完整个候选集（不是只吃最小 N 条）：粗筛命中的是「带日期前缀的 expires_at」，
+//! 不是「已经过期」，「有 expires_at 但仍有效」的行会长期留在候选集里。只取最小 N 条
+//! 会让 id 更大的过期行永远排不到，所以单轮内按 id 游标翻页，翻到不满一批为止。
+//!
 //! ⚠️ 脏行连带删除：写回按 `live` 落库，因此**同一文档里解析失败的脏 grant 会被这次
 //! 写回一起删掉**（它本来也不出现在任何 API 响应里）。纯脏行文档（唯一 grant 的
 //! expires_at 解析失败）粗筛正则就过不了，压根不进扫描集，脏值原样保留。
@@ -34,19 +38,25 @@ use crate::routes::{parse_meta, partition_grants, persist_document};
 /// 给个默认关的开关等于没修。
 const DEFAULT_INTERVAL_SECS: u64 = 900;
 
-/// 单轮候选上限。够覆盖当前量级；超出的留给下一轮（顺序按 id，不会饿死）。
+/// 单批条数（**不是**单轮上限）。一轮内按 id 游标翻页，扫完整个候选集。
+///
+/// 为什么必须翻页：粗筛命中的是「带日期前缀的 expires_at」，不是「已经过期」——
+/// 过 `now()` 的条目清完以后，那些「有 expires_at 但仍有效」的行**仍然留在候选集里**。
+/// 于是只取最小 N 条的写法每轮都卡在同一批，id 更大的过期行永远排不到（饿死）。
 const BATCH: i64 = 500;
 
 /// 粗筛：只要 metadata 里出现「permission + 带日期前缀的 expires_at」，就可能有过期条目。
 /// 刻意不 cast jsonb、不判 `<= now()`：判定只留一处（Rust `partition_grants`），
 /// 否则 SQL 与端点各一套 RFC3339 口径，迟早对不上。
+/// `$1` = 游标（上一批最后一个 id），`$2` = 单批条数。
 const CANDIDATE_SQL: &str = r#"
 SELECT id
 FROM documents
-WHERE metadata ~ '"permission"'
+WHERE id > $1
+  AND metadata ~ '"permission"'
   AND metadata ~ '"expires_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T'
 ORDER BY id
-LIMIT $1
+LIMIT $2
 "#;
 
 /// 一轮清扫的结果，仅用于日志与复烟取证。
@@ -103,73 +113,91 @@ pub fn spawn(state: AppState) {
 }
 
 async fn run_once(state: &AppState) {
-    match sweep_once(state).await {
-        Ok(stats) => {
-            // 复烟按这行取数；swept/cleared 分开才能证明「零过期不写库」。
-            tracing::info!(
-                scanned = stats.scanned,
-                cleared = stats.cleared,
-                expired = stats.expired,
-                "grants sweep 完成"
-            );
-        }
-        Err(e) => tracing::warn!(error = %e, "grants sweep 失败，等下一轮"),
-    }
+    let stats = sweep_once(state).await;
+    // 复烟按这行取数；scanned/cleared 分开才能证明「零过期不写库」。
+    tracing::info!(
+        scanned = stats.scanned,
+        cleared = stats.cleared,
+        expired = stats.expired,
+        "grants sweep 完成"
+    );
 }
 
-/// 单轮清扫。返回 `Err` 只表示候选查询失败（连库问题），单行失败只记日志不中断整轮。
-pub async fn sweep_once(state: &AppState) -> Result<SweepStats, sea_orm::DbErr> {
+/// 单轮清扫：按 id 游标把整个候选集翻一遍。
+///
+/// 候选查询失败只中止本轮（已处理的行计数照常上报），不把整轮结果吞成「失败」——
+/// 清扫是幂等的，下一轮会接着扫，但日志里的 cleared 不能因此变成 0。
+pub async fn sweep_once(state: &AppState) -> SweepStats {
     let now = now_tz();
-    let ids = candidate_ids(state).await?;
     let mut stats = SweepStats::default();
+    let mut cursor: i64 = 0;
 
-    for id in ids {
-        // 命中 id 后再取整行：persist_document 按整行回写其余列，
-        // 用粗筛时的快照会覆盖掉并发改动（正文/title），所以这里读最新值。
-        let row = match documents::Entity::find_by_id(id).one(&state.db).await {
-            Ok(Some(row)) => row,
-            Ok(None) => continue, // 粗筛与读之间被删
+    loop {
+        let ids = match candidate_ids(state, cursor).await {
+            Ok(ids) => ids,
             Err(e) => {
-                tracing::warn!(document_id = id, error = %e, "sweep 读行失败，跳过");
-                continue;
+                tracing::warn!(cursor, error = %e, "sweep 候选查询失败，中止本轮");
+                break;
             }
         };
-        stats.scanned += 1;
-
-        let mut meta = parse_meta(row.metadata.as_deref());
-        let (live, expired) = partition_grants(&meta, now);
-        if expired.is_empty() {
-            continue; // 零过期零写放大
+        if ids.is_empty() {
+            break;
         }
 
-        // expired 非空 ⟹ permission.grants 存在且是数组 ⟹ 父级 permission 一定在，
-        // 下面的下标赋值不会把 null 当对象去写。
-        let expired_count = expired.len() as u64;
-        meta["permission"]["grants"] = json!(live);
-        meta["permission"]["updated_at"] = json!(now.to_rfc3339());
-        match persist_document(state, row, meta, None, None).await {
-            Ok(_) => {
-                stats.cleared += 1;
-                stats.expired += expired_count;
+        for id in &ids {
+            // 命中 id 后再取整行：persist_document 按整行回写其余列，
+            // 用粗筛时的快照会覆盖掉并发改动（正文/title），所以这里读最新值。
+            let row = match documents::Entity::find_by_id(*id).one(&state.db).await {
+                Ok(Some(row)) => row,
+                Ok(None) => continue, // 粗筛与读之间被删
+                Err(e) => {
+                    tracing::warn!(document_id = id, error = %e, "sweep 读行失败，跳过");
+                    continue;
+                }
+            };
+            stats.scanned += 1;
+
+            let mut meta = parse_meta(row.metadata.as_deref());
+            let (live, expired) = partition_grants(&meta, now);
+            if expired.is_empty() {
+                continue; // 零过期零写放大
             }
-            Err(resp) => {
-                tracing::warn!(
-                    document_id = id,
-                    status = resp.status().as_u16(),
-                    "sweep 回写失败，跳过"
-                );
+
+            // expired 非空 ⟹ permission.grants 存在且是数组 ⟹ 父级 permission 一定在，
+            // 下面的下标赋值不会把 null 当对象去写。
+            let expired_count = expired.len() as u64;
+            let next_size = row.file_size; // 与 GET 惰性清理同口径：体积列按原值回写，不能传 None
+            meta["permission"]["grants"] = json!(live);
+            meta["permission"]["updated_at"] = json!(now.to_rfc3339());
+            match persist_document(state, row, meta, None, next_size).await {
+                Ok(_) => {
+                    stats.cleared += 1;
+                    stats.expired += expired_count;
+                }
+                Err(resp) => {
+                    tracing::warn!(
+                        document_id = id,
+                        status = resp.status().as_u16(),
+                        "sweep 回写失败，跳过"
+                    );
+                }
             }
+        }
+
+        cursor = *ids.last().expect("ids 非空已在上方判过");
+        if (ids.len() as i64) < BATCH {
+            break; // 本批不满，说明已到候选集尾部
         }
     }
 
-    Ok(stats)
+    stats
 }
 
-async fn candidate_ids(state: &AppState) -> Result<Vec<i64>, sea_orm::DbErr> {
+async fn candidate_ids(state: &AppState, after_id: i64) -> Result<Vec<i64>, sea_orm::DbErr> {
     let stmt = sea_orm::Statement::from_sql_and_values(
         state.db.get_database_backend(),
         CANDIDATE_SQL,
-        [(BATCH).into()],
+        [after_id.into(), BATCH.into()],
     );
     let rows = state.db.query_all(stmt).await?;
     Ok(rows
