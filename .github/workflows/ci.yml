@@ -1,12 +1,20 @@
 # api-gateway 是 ADR-0012《THOMAS 生态身份统一》定义的「网关唯一验签点」，
 # 也是单 1（双轨验签 + 双头注入）的落地处。本仓此前没有任何 CI，
-# 该目录的改动因此缺少最小门禁。本工作流只做一件事：保证 api-gateway 能编译、能构建测试。
+# 该目录的改动因此缺少最小门禁。本工作流只做一件事：保证被列举的服务能编译
+# （api-gateway 另加构建测试）。
 #
-# 为什么不是 `cargo check --workspace`：
-#   1. upload-service 依赖 llama_cpp_rs（需在 runner 上编译 C++/llama.cpp），干净环境构建失败；
-#   2. 根 Cargo.toml 中 Phase-2 服务（job-service / resume-service /
-#      application-service / company-service）处于注释状态。
-#   ⇒ 全工作区 check 在本地与 CI 都会红，且红的原因与被改代码无关，会变成噪声门禁。
+# 门禁范围按服务显式列举，不用 `cargo check --workspace`：
+#   1. upload-service 的 local-llm feature 走 llama_cpp_rs，其 build.rs 用 bindgen
+#      ⇒ 构建期必需 libclang，干净 runner 上不保证具备；
+#   2. 根 Cargo.toml 自 2026-10-16 起已启用 Phase-2 服务（job-service / resume-service /
+#      application-service / company-service），不再是注释态；但「全量 workspace 能否在
+#      干净环境绿」从未验证过。
+#   ⇒ 全工作区 check 一旦红，原因可能与被改代码无关，会变成噪声门禁。
+#
+# 当前纳入：
+#   - api-gateway   ：check + test
+#   - resume-service：check（2026-10-30 加入。此前该服务的改动远端零编译门禁，
+#                     expires_at 后台清扫（PR #36）就是在这个空门下合入的）
 #
 # 本次刻意不纳入的门禁（避免引入「出生即长期红」的假门禁）：
 #   - `cargo fmt --all --check`：现有代码非 fmt-clean（实测 59 行差异，含 api-gateway/src/tatha.rs）
@@ -27,9 +35,11 @@ concurrency:
 jobs:
   api-gateway:
     name: api-gateway (check + test)
-    runs-on: ubuntu-latest
+    # 钉镜像不用 ubuntu-latest：latest 已在 2026-10-19 起迁往 Ubuntu 26，
+    # 漂移会在某天让门禁无故变色（planetx-miniprogram #6 同类告警）。
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,3 +52,21 @@ jobs:
 
       - name: cargo test -p api-gateway --locked
         run: cargo test -p api-gateway --locked
+
+  resume-service:
+    name: resume-service (check)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 只 check 不 test：该服务当前没有 tests 目录，跑 test 只是把二进制再建一遍。
+      # 与 api-gateway 分 job 而非串行，是为了让「resume 编译断了」和
+      # 「gateway 测试断了」在 PR 上显示为两条独立结果，不互相遮住。
+      - name: cargo check -p resume-service --locked
+        run: cargo check -p resume-service --locked
