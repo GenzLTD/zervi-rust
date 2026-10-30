@@ -46,15 +46,24 @@ bash scripts/local-dev-up/down.sh
 
 运行态一律进 **`.tmp-pg/`**（已 gitignore）：数据目录、日志、PID、consent 落盘、runtime.env。
 
+## 多机（Surface / Mac / Dell）
+
+**一机跑栈、多机跑开发者工具。** 推荐 ServBay 作栈主机；Surface / Mac / Dell 只改 `LOCAL_GATEWAY_ORIGIN` 指栈主机局域网 IP。
+
+完整角色、防火墙、clone 纪律见 **[FLEET.md](./FLEET.md)**。`up` 结束会打印候选 `http://<LAN>:3333`；栈主机首次需管理员跑 `open-firewall-3333.ps1`。
+
+Mac **本刀不承栈**（脚本仍依赖 ServBay PG / Windows 杀端口）；Mac 只做客户端。
+
 ## 小程序开关
 
 `planetx-miniprogram/packages/miniprogram/utils/config.ts`：
 
 ```ts
-const USE_LOCAL_GATEWAY = true  // 本机临时
+const USE_LOCAL_GATEWAY = true  // 本机临时；提交前改回 false
+const LOCAL_GATEWAY_ORIGIN = 'http://127.0.0.1:3333'           // 同机
+// const LOCAL_GATEWAY_ORIGIN = 'http://192.168.x.x:3333'      // Surface/Mac/Dell → 栈主机
 ```
 
-- 指向 `http://127.0.0.1:3333`
 - **提交前必须改回 `false`**（`config.test.ts` + CI 会红）
 - 开发者工具：详情 → 本地设置 → **不校验合法域名** → 清缓存并编译
 

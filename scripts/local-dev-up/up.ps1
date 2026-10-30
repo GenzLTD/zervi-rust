@@ -171,7 +171,18 @@ Write-Host ""
 Write-Host "栈已起："
 Write-Host "  pg             :55433"
 Write-Host "  resume-service :3003  pid=$($resume.Id)"
-Write-Host "  api-gateway    :3333  pid=$($gw.Id)"
+Write-Host "  api-gateway    :3333  pid=$($gw.Id)  (0.0.0.0)"
 Write-Host "  legacy stub v2 :5200  pid=$($stub.Id)"
+Write-Host ""
+Write-Host "局域网入口（Surface/Mac/Dell 客户端改 LOCAL_GATEWAY_ORIGIN）："
+Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object {
+    $_.IPAddress -notlike '127.*' -and
+    $_.IPAddress -notlike '169.254.*' -and
+    $_.InterfaceAlias -notmatch 'WSL|vEthernet|Loopback|Docker|Hyper-V'
+  } |
+  ForEach-Object { Write-Host ("  http://{0}:3333  ({1})" -f $_.IPAddress, $_.InterfaceAlias) }
+Write-Host "防火墙（栈主机首次）：管理员运行 open-firewall-3333.ps1"
+Write-Host "多机说明：scripts/local-dev-up/FLEET.md"
 Write-Host "抽检:  powershell -File scripts/local-dev-up/smoke_check.ps1"
 Write-Host "收尾:  powershell -File scripts/local-dev-up/down.ps1"

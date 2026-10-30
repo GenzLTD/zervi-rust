@@ -237,11 +237,30 @@ echo ""
 echo "栈已起："
 echo "  pg            :55433  (genzltd_sim)"
 echo "  resume-service:$RESUME_PORT  pid=$RESUME_PID"
-echo "  api-gateway   :3333  pid=$GW_PID"
+echo "  api-gateway   :3333  pid=$GW_PID  (0.0.0.0)"
 echo "  legacy stub v2:5200  pid=$STUB_PID  store=$STORE"
 echo ""
+echo "局域网入口（Surface/Mac/Dell 客户端改 LOCAL_GATEWAY_ORIGIN）："
+if command -v ipconfig.exe >/dev/null 2>&1; then
+  ipconfig.exe | tr -d '\r' | awk '
+    /^[A-Za-z].*:$/ { iface=$0; next }
+    /IPv4/ {
+      for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        ip=$i
+        if (ip !~ /^127\./ && ip !~ /^169\.254\./)
+          print "  http://" ip ":3333  (" iface ")"
+      }
+    }'
+elif command -v ip >/dev/null 2>&1; then
+  ip -4 -o addr show scope global | awk '{print "  http://" $4 ":3333  (" $2 ")"}' | sed 's|/.*:3333|:3333|'
+fi
+echo "防火墙（Windows 栈主机首次）：管理员运行 open-firewall-3333.ps1"
+echo "多机说明：scripts/local-dev-up/FLEET.md"
+echo ""
 echo "小程序：packages/miniprogram/utils/config.ts → USE_LOCAL_GATEWAY = true"
+echo "       LOCAL_GATEWAY_ORIGIN = http://<栈主机LAN>:3333（跨机必改）"
 echo "       （提交前改回 false；config.test.ts 会拦）"
 echo "抽检：  bash scripts/local-dev-up/smoke_check.sh"
+echo "       BASE=http://<LAN>:3333 bash scripts/local-dev-up/smoke_check.sh  # 远端"
 echo "收尾：  bash scripts/local-dev-up/down.sh"
 echo "清单：  scripts/local-dev-up/README.md"
