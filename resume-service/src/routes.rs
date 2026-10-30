@@ -20,7 +20,8 @@
 //! `metadata.permission = {visibility, grants, updated_at}`——与 detail 读的是同一处，
 //! 不另建表、不留第二条写路径。grants 为全量替换：PUT 省略 grants 等于清空。
 //! expires_at 语义（2026-10-30）：过期的 grant 读响应不返回、业务判定按无授权处理；
-//! GET 读到过期条目就地剔除回写、PUT 写前剔除（惰性清理），全表清扫留给后续后台任务。
+//! GET 读到过期条目就地剔除回写、PUT 写前剔除（惰性清理），全表清扫交给后台
+//! `sweep`（`RESUME_SWEEP_INTERVAL_SECS`，见 sweep.rs）——判定与写回复用本文件同两个函数。
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -896,7 +897,8 @@ fn grant_expired(grant: &Value, now: chrono::DateTime<chrono::FixedOffset>) -> b
 
 /// 从 metadata.permission.grants 拆（未过期, 已过期）。
 /// 归一化失败的脏行：不进 live 也不进 expired（permission_json 同口径直接过滤掉）。
-fn partition_grants(meta: &Value, now: chrono::DateTime<chrono::FixedOffset>) -> (Vec<Value>, Vec<Value>) {
+/// `pub(crate)`：后台清扫 `sweep` 必须用同一套判定，不许另写一份。
+pub(crate) fn partition_grants(meta: &Value, now: chrono::DateTime<chrono::FixedOffset>) -> (Vec<Value>, Vec<Value>) {
     let mut live = Vec::new();
     let mut expired = Vec::new();
     let grants = meta
@@ -1055,7 +1057,8 @@ async fn update_resume(
 
 /// 正文与授权面共用同一条写回路径：只改 metadata（+ 可选 title/file_size），
 /// 其余列按原值回写，避免两处各写一套 ActiveModel 后漂移。
-async fn persist_document(
+/// `pub(crate)`：后台清扫走同一条写回，保证 `updated_at` 语义与端点一致。
+pub(crate) async fn persist_document(
     state: &AppState,
     row: documents::Model,
     meta: Value,
@@ -1325,7 +1328,7 @@ async fn analyze(state: &AppState, doc_type: &str, text: &str) -> Result<Value, 
     })
 }
 
-fn parse_meta(raw: Option<&str>) -> Value {
+pub(crate) fn parse_meta(raw: Option<&str>) -> Value {
     // 只接受 JSON 对象：后面所有写回都是 meta["xxx"] = ... 的下标赋值，
     // 非对象（null / 数组 / 字符串）会让下标赋值 panic，这里统一归一为 {}。
     let parsed = raw.and_then(|s| serde_json::from_str::<Value>(s).ok());
