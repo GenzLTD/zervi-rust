@@ -51,8 +51,12 @@ Dell / Surface 若自备 PostgreSQL 16，也可临时当栈主机；**Mac 本刀
    const LOCAL_GATEWAY_ORIGIN = 'http://192.168.x.x:3333'  // 栈主机 LAN IP
    ```
 
-3. 微信开发者工具：**不校验合法域名** → 清缓存编译 → 求职 Tab。
-4. 远端抽检（可选，在客户端或任意同网段机）：
+3. **登录必读**：`USE_LOCAL_GATEWAY` 打开后，`api.ts` 的 `wechatLogin` 走 gateway `local_auth`（默认账号 `mp-devtools@local.test` / `Passw0rd!`），把 `token` 映射为 `access_token`。  
+   裸打 `POST /v1/auth/wechat` 会 200 但只有 `{via:"legacy-stub"}`——**无 token，会停在登录**（Mac 已踩坑）。拉含此补丁的 planetx 分支/main；旧仓若无补丁需对齐同一改法。共用账号则简历库互通。
+
+4. 微信开发者工具：**不校验合法域名** → 清缓存编译 → 求职 Tab。  
+   `game/profile`、`auth/profile` 回 stub、`/v1/jobs/*` 502 预期；鸿蒙真机不要走 LAN HTTP。
+5. 远端抽检（可选，在客户端或任意同网段机）：
 
    ```powershell
    $env:BASE = 'http://192.168.x.x:3333'
@@ -63,7 +67,7 @@ Dell / Surface 若自备 PostgreSQL 16，也可临时当栈主机；**Mac 本刀
    BASE=http://192.168.x.x:3333 bash scripts/local-dev-up/smoke_check.sh
    ```
 
-5. 收工：开关改回 `false`；栈主机执行 `down`。
+6. 收工：`USE_LOCAL_GATEWAY` 改回 `false`（勿提交）；栈主机执行 `down`。
 
 ### Mac 注意
 
