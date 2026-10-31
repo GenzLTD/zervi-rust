@@ -51,7 +51,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 # 兜底按端口清（防 PID 文件过期）
-for p in 5200 3003 3333; do
+for p in 5200 3004 3003 3333; do
   kill_port "$p"
 done
 

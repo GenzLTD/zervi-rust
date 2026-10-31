@@ -1,5 +1,5 @@
 ﻿# local-dev-up (Windows PowerShell)
-# pg :55433 → resume :3003 → gateway :3333 → legacy stub v2 :5200
+# pg :55433 → resume :3003 → job :3004 → gateway :3333 → legacy stub v2 :5200
 param(
   [switch]$SkipBuild,
   [switch]$RefreshEnv,
@@ -59,6 +59,7 @@ SUPABASE_JWT_SECRET=$supabase
 ZERVI_DEV_AUTH=1
 ZERVI_DEV_BYPASS_CONSENT=1
 RESUME_PORT=3003
+JOB_PORT=3004
 RESUME_SWEEP_INTERVAL_SECS=900
 DEPLOY_REGION=CN
 DEEPSEEK_API_KEY=$deepseek
@@ -121,21 +122,22 @@ Apply-RuntimeEnv
 
 # --- build ---
 $rsBin = Join-Path $Root "target\debug\resume-service.exe"
+$jobBin = Join-Path $Root "target\debug\job-service.exe"
 $gwBin = Join-Path $Root "target\debug\api-gateway.exe"
-if (-not $SkipBuild -and (-not (Test-Path $rsBin) -or -not (Test-Path $gwBin))) {
+if (-not $SkipBuild -and (-not (Test-Path $rsBin) -or -not (Test-Path $jobBin) -or -not (Test-Path $gwBin))) {
   Write-Host "[build] cargo build"
   $cargoBin = "C:\ServBay\packages\rust\current\cargo\bin"
   $rustcBin = "C:\ServBay\packages\rust\current\rustc\bin"
   $env:PATH = "$cargoBin;$rustcBin;$env:PATH"
   Push-Location $Root
-  cargo build -p resume-service -p api-gateway
+  cargo build -p resume-service -p job-service -p api-gateway
   Pop-Location
 } else {
   Write-Host "[build] skip"
 }
 
 # --- processes ---
-Kill-Port 5200; Kill-Port 3003; Kill-Port 3333
+Kill-Port 5200; Kill-Port 3003; Kill-Port 3004; Kill-Port 3333
 $pyCmd = Get-Command python -ErrorAction SilentlyContinue
 $py = if ($pyCmd) { $pyCmd.Source } else { "python" }
 Write-Host "[stub] legacy_stub_v2 :5200"
@@ -148,6 +150,10 @@ Write-Host "[resume] :3003"
 $resume = Start-Process -FilePath $rsBin -WorkingDirectory $Root `
   -RedirectStandardOutput (Join-Path $Tmp "resume.log") -RedirectStandardError (Join-Path $Tmp "resume.err.log") `
   -PassThru -WindowStyle Hidden
+Write-Host "[job] :3004"
+$job = Start-Process -FilePath $jobBin -WorkingDirectory $Root `
+  -RedirectStandardOutput (Join-Path $Tmp "job.log") -RedirectStandardError (Join-Path $Tmp "job.err.log") `
+  -PassThru -WindowStyle Hidden
 Write-Host "[gateway] :3333"
 $gw = Start-Process -FilePath $gwBin -WorkingDirectory $Root `
   -RedirectStandardOutput (Join-Path $Tmp "gateway.log") -RedirectStandardError (Join-Path $Tmp "gateway.err.log") `
@@ -156,6 +162,7 @@ $gw = Start-Process -FilePath $gwBin -WorkingDirectory $Root `
 @"
 stub=$($stub.Id)
 resume=$($resume.Id)
+job=$($job.Id)
 gateway=$($gw.Id)
 "@ | Set-Content $PidFile -Encoding ascii
 
@@ -163,7 +170,8 @@ for ($i = 0; $i -lt 20; $i++) {
   try {
     $r1 = Invoke-WebRequest -Uri "http://127.0.0.1:3333/health" -UseBasicParsing -TimeoutSec 1
     $r2 = Invoke-WebRequest -Uri "http://127.0.0.1:5200/health" -UseBasicParsing -TimeoutSec 1
-    if ($r1.StatusCode -eq 200 -and $r2.StatusCode -eq 200) { break }
+    $r3 = Invoke-WebRequest -Uri "http://127.0.0.1:3004/v1/jobs/list" -UseBasicParsing -TimeoutSec 1
+    if ($r1.StatusCode -eq 200 -and $r2.StatusCode -eq 200 -and $r3.StatusCode -eq 200) { break }
   } catch { Start-Sleep -Milliseconds 500 }
 }
 
@@ -171,8 +179,10 @@ Write-Host ""
 Write-Host "栈已起："
 Write-Host "  pg             :55433"
 Write-Host "  resume-service :3003  pid=$($resume.Id)"
+Write-Host "  job-service    :3004  pid=$($job.Id)"
 Write-Host "  api-gateway    :3333  pid=$($gw.Id)  (0.0.0.0)"
 Write-Host "  legacy stub v2 :5200  pid=$($stub.Id)"
+Write-Host "演示职位：见 FLEET.md / 清单 seed-demo（本脚本不自动灌）"
 Write-Host ""
 Write-Host "局域网入口（Surface/Mac/Dell 客户端改 LOCAL_GATEWAY_ORIGIN）："
 Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |

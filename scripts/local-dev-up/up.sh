@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # local-dev-up：一键起本机联调栈
-#   pg :55433 → resume-service :3003 → api-gateway :3333 → legacy stub v2 :5200
+#   pg :55433 → resume :3003 → job :3004 → api-gateway :3333 → legacy stub v2 :5200
 #
 # 用法（Git Bash / WSL）：
 #   bash scripts/local-dev-up/up.sh
@@ -143,6 +143,7 @@ SUPABASE_JWT_SECRET=$supabase
 ZERVI_DEV_AUTH=1
 ZERVI_DEV_BYPASS_CONSENT=1
 RESUME_PORT=3003
+JOB_PORT=3004
 RESUME_SWEEP_INTERVAL_SECS=900
 DEPLOY_REGION=CN
 DEEPSEEK_API_KEY=$deepseek
@@ -168,21 +169,22 @@ set +a
 need_build() {
   [[ "${SKIP_BUILD:-0}" == "1" ]] && return 1
   local rs="$ROOT/target/debug/resume-service.exe"
+  local job="$ROOT/target/debug/job-service.exe"
   local gw="$ROOT/target/debug/api-gateway.exe"
-  [[ ! -f "$rs" || ! -f "$gw" ]] && return 0
+  [[ ! -f "$rs" || ! -f "$job" || ! -f "$gw" ]] && return 0
   # 源码比二进制新则重建
-  find "$ROOT/resume-service/src" "$ROOT/api-gateway/src" "$ROOT/shared/common/src" \
+  find "$ROOT/resume-service/src" "$ROOT/job-service/src" "$ROOT/api-gateway/src" "$ROOT/shared/common/src" \
     -type f -name '*.rs' -newer "$rs" 2>/dev/null | grep -q . && return 0
   return 1
 }
 
 if need_build; then
-  echo "[build] cargo build -p resume-service -p api-gateway"
+  echo "[build] cargo build -p resume-service -p job-service -p api-gateway"
   (
     cd "$ROOT"
     # ServBay rustc/cargo PATH
     export PATH="/c/ServBay/packages/rust/current/cargo/bin:/c/ServBay/packages/rust/current/rustc/bin:$PATH"
-    cargo build -p resume-service -p api-gateway
+    cargo build -p resume-service -p job-service -p api-gateway
   )
 else
   echo "[build] skip (binaries fresh; SKIP_BUILD=1 or newer)"
@@ -195,8 +197,9 @@ python "$SCRIPT_DIR/legacy_stub_v2.py" --port 5200 --store "$STORE" \
   >"$LOG/stub.log" 2>&1 &
 STUB_PID=$!
 
-# --- 5) resume + gateway ---
+# --- 5) resume + job + gateway ---
 kill_port 3003
+kill_port 3004
 kill_port 3333
 echo "[resume] :3003"
 (
@@ -207,6 +210,16 @@ echo "[resume] :3003"
   exec ./target/debug/resume-service.exe
 ) >"$LOG/resume.log" 2>&1 &
 RESUME_PID=$!
+
+echo "[job] :3004"
+(
+  set -a; source "$RUNTIME_ENV"; set +a
+  export NO_PROXY=127.0.0.1,localhost,::1
+  unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
+  cd "$ROOT"
+  exec ./target/debug/job-service.exe
+) >"$LOG/job.log" 2>&1 &
+JOB_PID=$!
 
 echo "[gateway] :3333"
 (
@@ -221,13 +234,15 @@ GW_PID=$!
 cat > "$PID_FILE" <<EOF
 stub=$STUB_PID
 resume=$RESUME_PID
+job=$JOB_PID
 gateway=$GW_PID
 EOF
 
 # --- wait ---
 for i in $(seq 1 20); do
   if curl -sS -m 1 --noproxy '*' "http://127.0.0.1:3333/health" >/dev/null 2>&1 \
-     && curl -sS -m 1 --noproxy '*' "http://127.0.0.1:5200/health" >/dev/null 2>&1; then
+     && curl -sS -m 1 --noproxy '*' "http://127.0.0.1:5200/health" >/dev/null 2>&1 \
+     && curl -sS -m 1 --noproxy '*' "http://127.0.0.1:3004/v1/jobs/list" >/dev/null 2>&1; then
     break
   fi
   sleep 0.5
@@ -237,8 +252,10 @@ echo ""
 echo "栈已起："
 echo "  pg            :55433  (genzltd_sim)"
 echo "  resume-service:$RESUME_PORT  pid=$RESUME_PID"
+echo "  job-service   :${JOB_PORT:-3004}  pid=$JOB_PID"
 echo "  api-gateway   :3333  pid=$GW_PID  (0.0.0.0)"
 echo "  legacy stub v2:5200  pid=$STUB_PID  store=$STORE"
+echo "演示职位：POST /v1/jobs/seed-demo（本脚本不自动灌）"
 echo ""
 echo "局域网入口（Surface/Mac/Dell 客户端改 LOCAL_GATEWAY_ORIGIN）："
 if command -v ipconfig.exe >/dev/null 2>&1; then

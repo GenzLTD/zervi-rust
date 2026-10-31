@@ -101,12 +101,11 @@ if [[ -n "$RID" && "$RID" != "None" ]]; then
   [[ "$CODE" == "200" ]] && ok "permission $CODE" || bad "permission $CODE"
 fi
 
-# 已知空白：job-service
 req GET /v1/jobs/list "$TOKEN"
-if [[ "$CODE" == "502" ]]; then
-  ok "jobs/list 502（预期：job-service :3004 未编）"
+if [[ "$CODE" == "200" ]]; then
+  ok "jobs/list $CODE"
 else
-  bad "jobs/list 期望 502 得 $CODE"
+  bad "jobs/list 期望 200 得 $CODE $BODY"
 fi
 
 echo ""

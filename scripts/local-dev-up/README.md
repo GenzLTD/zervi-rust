@@ -1,6 +1,6 @@
 # local-dev-up —— 本机联调一键栈
 
-把「开发者工具一次点通」变成可复用路径：临时 PG + resume-service + api-gateway + **consent 感知的 legacy stub v2**（顶替真 Flask）。
+把「开发者工具一次点通」变成可复用路径：临时 PG + resume-service + **job-service** + api-gateway + **consent 感知的 legacy stub v2**（顶替真 Flask）。
 
 ```
 小程序 USE_LOCAL_GATEWAY=true
@@ -8,11 +8,14 @@
         ▼
  api-gateway :3333
    ├─ /v1/resume/*     → resume-service :3003
+   ├─ /v1/jobs/*       → job-service :3004（list/search 查库；match 为 LLM 即席）
    ├─ /v1/auth/register|login|me → local_auth（ZERVI_DEV_AUTH=1）
    └─ 其余 fallback    → legacy stub v2 :5200
-                            └─ consent status/grant/revoke 落盘
+                            └─ consent / wechat(looma JWT) 落盘
  pg :55433 / genzltd_sim
 ```
+
+演示职位需另调一次 `POST /v1/jobs/seed-demo`（幂等）；`up` 不自动灌。
 
 ## 一键起 / 收尾
 
@@ -82,11 +85,11 @@ const LOCAL_GATEWAY_ORIGIN = 'http://127.0.0.1:3333'           // 同机
 7. consent：v2 stub 下 **授权一次后跨重启仍直接放行**（落盘 `.tmp-pg/consent_store.json`）
 8. 收尾：`bash scripts/local-dev-up/down.sh`，开关改回 `false`
 
-### 已知空白（本刀不收）
+### 已知空白 / 预期
 
-| 缺口 | 现象 | 后续 |
+| 项 | 现象 | 说明 |
 | --- | --- | --- |
-| job-service `:3004` | `/v1/jobs/list` / `/v1/jobs/match` → **502** | 另刀入编排 |
+| `/v1/jobs/match` | LLM 即席，**不查职位库** | 列表是真库；匹配是演示行为 |
 | 真 Flask 栈 | 本路径默认 stub | 「本机可起真 Flask」挂账 |
 | `/v1/game/match` | 游戏域，**不是**求职岗位匹配 | 勿当 career 验收 |
 

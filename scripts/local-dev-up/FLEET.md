@@ -57,7 +57,7 @@ Dell / Surface 若自备 PostgreSQL 16，也可临时当栈主机；**Mac 本刀
    自验：`curl.exe -s -X POST http://192.168.3.81:3333/v1/auth/wechat -H "Content-Type: application/json" -d "{\"code\":\"dev\"}"` 应含 `access_token`。
 
 4. 微信开发者工具：**不校验合法域名** → 清缓存编译 → 求职 Tab。  
-   `game/profile`、`auth/profile` 回 stub、`/v1/jobs/*` 502 预期；鸿蒙真机不要走 LAN HTTP。
+   `game/profile`、`auth/profile` 回 stub 预期；`/v1/jobs/list` 应 200（需栈已起 job-service + 可选 seed-demo）；鸿蒙真机不要走 LAN HTTP。
 5. 远端抽检（可选，在客户端或任意同网段机）：
 
    ```powershell
@@ -90,6 +90,6 @@ Dell 侧单分支 fetch、缺 remote-tracking，是 clone 配置差，不是远�
 
 | 缺口 | 现象 |
 | --- | --- |
-| job-service `:3004` | `/v1/jobs/*` → 502 |
+| `/v1/jobs/match` | LLM 即席生成，不查职位库（list 才是真库） |
 | 真机预览 | 仍受微信合法域名与 HTTP 限制；本路径优先 **开发者工具** |
 | Mac 作栈主机 | 另刀（Homebrew PG + 去 PowerShell 依赖） |

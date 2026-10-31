@@ -86,8 +86,8 @@ if ($rid) {
 }
 
 $j = Req GET /v1/jobs/list $token
-if ($j.Code -eq 502) { Ok "jobs/list 502（预期：job-service 未编）" }
-else { Bad "jobs/list 期望 502 得 $($j.Code)" }
+if ($j.Code -eq 200) { Ok "jobs/list 200" }
+else { Bad "jobs/list 期望 200 得 $($j.Code) $($j.Body)" }
 
 Write-Host ""
 Write-Host "PASS=$Pass FAIL=$Fail"
