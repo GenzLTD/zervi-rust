@@ -13,7 +13,8 @@ pub use consent::require_consent;
 pub use error::{fail, fail_extra, LoomaError};
 pub use quota::{consume_daily, Resource};
 pub use x1::{
-    call_llm, is_overseas_deploy, qcc_disabled_reason, safe_llm_provider_order, Settings,
+    allow_cloud_for_unredacted, call_llm, call_llm_unredacted, is_overseas_deploy,
+    qcc_disabled_reason, safe_llm_provider_order, unredacted_llm_providers, Settings,
 };
 
 use sea_orm::DatabaseConnection;

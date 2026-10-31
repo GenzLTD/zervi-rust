@@ -1,6 +1,7 @@
 //! `/v1/jobs/*`（9）与 `/v1/job-posts*`（5）。B 轨 job_posts 不收口。
 //! `GET /v1/job-posts/:id/matches` 是关键词计分，不进 LLM。
-//! `POST /v1/jobs/match|parse|upload` 的模型调用走 X1。
+//! `POST /v1/jobs/match` 对库内职位检索；理由可走 X1，对不上 job_id 的项丢弃。
+//! `POST /v1/jobs/parse|upload` 的模型调用走 X1。
 
 use axum::{
     extract::{Path, Query, State},
@@ -169,28 +170,56 @@ async fn match_jobs(
     if let Err(r) = consume_daily(&state, &principal, Resource::JobMatch).await {
         return r;
     }
-    let Some(raw) = common::looma::call_llm(
+    match library_match_payload(&state, body.resume_text.trim()).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
+    }
+}
+
+async fn library_match_payload(state: &AppState, resume_text: &str) -> Result<Value, String> {
+    let jobs = load_jobs(state).await?;
+    let total_evaluated = jobs.iter().filter_map(crate::library_match::job_id).count();
+    if total_evaluated == 0 {
+        return Ok(json!({
+            "matches": [],
+            "total_evaluated": 0,
+            "match_status": "empty_library",
+        }));
+    }
+    let ranked = crate::library_match::rank_library_jobs(resume_text, &jobs);
+    if ranked.is_empty() {
+        return Ok(json!({
+            "matches": [],
+            "total_evaluated": total_evaluated,
+            "match_status": "no_fit",
+        }));
+    }
+    let prompt_ids: Vec<String> = ranked
+        .iter()
+        .filter_map(|m| m.get("job_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    let matches = if let Some(raw) = common::looma::call_llm_unredacted(
         &state.settings,
-        &format!(
-            "根据简历给出职位匹配 JSON，字段 matches（数组）。简历：\n{}",
-            body.resume_text.chars().take(4000).collect::<String>()
-        ),
+        &crate::library_match::catalog_prompt(resume_text, &ranked, &jobs),
         0.2,
     )
     .await
-    else {
-        return fail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "match_failed",
-            "AI 服务暂不可用（区域过滤后无可用模型，或上游失败）",
-        );
+    {
+        let parsed = json_block(&raw).unwrap_or_else(|| json!({}));
+        let llm_matches = parsed
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        crate::library_match::pin_to_catalog(&prompt_ids, &llm_matches, &ranked)
+    } else {
+        ranked
     };
-    let parsed = json_block(&raw).unwrap_or_else(|| json!({ "raw": raw }));
-    Json(json!({
-        "matches": parsed.get("matches").cloned().unwrap_or(json!([])),
-        "total_evaluated": parsed.get("matches").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0),
+    Ok(json!({
+        "matches": matches,
+        "total_evaluated": total_evaluated,
+        "match_status": "ok",
     }))
-    .into_response()
 }
 
 #[derive(Deserialize, Default)]

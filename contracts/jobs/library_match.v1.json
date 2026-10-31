@@ -1,0 +1,36 @@
+{
+  "id": "jobs.library_match.v1",
+  "title": "库内职位匹配（非 Tatha 11 维 JobMatchItem）",
+  "notes": "真源在本文件。小程序 shared-core 的 JobMatchItem 是另一套评分引擎，不要混用。未脱敏简历默认只打本机 Ollama；JOB_MATCH_ALLOW_CLOUD_LLM=1 才允许云模型。matches 不写入简历 metadata。",
+  "endpoints": {
+    "POST /v1/jobs/match": {
+      "request": { "resume_text": "string, min 20 chars" },
+      "response": {
+        "matches": "LibraryJobMatchItem[]",
+        "total_evaluated": "number",
+        "match_status": "ok | no_fit | empty_library | unavailable | quota_exceeded",
+        "match_error": "string?"
+      }
+    },
+    "POST /v1/resume/ingest": {
+      "request": { "markdown": "string", "filename": "string?", "extracted": "object?" },
+      "response": {
+        "resume_id": "string",
+        "status": "processed | stored",
+        "matches": "LibraryJobMatchItem[]",
+        "total_evaluated": "number",
+        "match_status": "ok | no_fit | empty_library | unavailable | quota_exceeded | skipped_duplicate",
+        "match_error": "string?"
+      },
+      "idempotency": "same owner + markdown sha256 → same resume_id, skip rematch, no extra JobMatch quota"
+    }
+  },
+  "LibraryJobMatchItem": {
+    "job_id": "库内职位 id，必须能 GET /v1/jobs/:id",
+    "title": "库内 canonical title，禁止 LLM 改名",
+    "company": "库内 canonical company",
+    "score": "0..1 词面基线分",
+    "reasons": "string[]",
+    "gaps": "string[]"
+  }
+}

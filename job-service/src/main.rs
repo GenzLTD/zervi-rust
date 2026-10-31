@@ -1,3 +1,4 @@
+mod library_match;
 mod routes;
 
 use common::looma::AppState;
