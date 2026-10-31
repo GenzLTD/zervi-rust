@@ -51,8 +51,10 @@ Dell / Surface 若自备 PostgreSQL 16，也可临时当栈主机；**Mac 本刀
    const LOCAL_GATEWAY_ORIGIN = 'http://192.168.x.x:3333'  // 栈主机 LAN IP
    ```
 
-3. **登录必读**：`USE_LOCAL_GATEWAY` 打开后，`api.ts` 的 `wechatLogin` 走 gateway `local_auth`（默认账号 `mp-devtools@local.test` / `Passw0rd!`），把 `token` 映射为 `access_token`。  
-   裸打 `POST /v1/auth/wechat` 会 200 但只有 `{via:"legacy-stub"}`——**无 token，会停在登录**（Mac 已踩坑）。拉含此补丁的 planetx 分支/main；旧仓若无补丁需对齐同一改法。共用账号则简历库互通。
+3. **登录两条路**（stub 跑在**栈主机**，客户端不要起 :5200）：
+   - **local_auth（Mac/华为已通）**：planetx `api.ts` 在 `USE_LOCAL_GATEWAY` 下改打 register/login（`mp-devtools@local.test` / `Passw0rd!`）。
+   - **原生 wechat（Dell 零注入）**：`legacy_stub_v2` 的 `POST /v1/auth/wechat` 用 **`JWT_SECRET` + `iss=looma`** 签发真 HS256（可过 resume）。勿用未验签的 `dev-signature` 假 JWT——能登录但 career 会 401。  
+   自验：`curl.exe -s -X POST http://192.168.3.81:3333/v1/auth/wechat -H "Content-Type: application/json" -d "{\"code\":\"dev\"}"` 应含 `access_token`。
 
 4. 微信开发者工具：**不校验合法域名** → 清缓存编译 → 求职 Tab。  
    `game/profile`、`auth/profile` 回 stub、`/v1/jobs/*` 502 预期；鸿蒙真机不要走 LAN HTTP。

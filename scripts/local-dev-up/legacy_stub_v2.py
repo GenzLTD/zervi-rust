@@ -7,6 +7,8 @@
   · GET  /v1/compliance/consent/status  → {status:{scope:bool}}（ensureConsent 直通）
   · POST /v1/compliance/consent/grant   → 落盘，跨重启保留
   · POST /v1/compliance/consent/revoke
+  · POST /v1/auth/wechat                → 签发 iss=looma 的 HS256 JWT（与 resume 同钥），
+                                          供开发者工具原生 wx.login 流；需环境变量 JWT_SECRET
   · 其余路径回声 JSON（via=legacy-stub），供网关 fallback 透传探针
 
 双栈：同时听 127.0.0.1 与 ::1（网关写死 localhost:5200，Windows 常先解析 IPv6）。
@@ -18,9 +20,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
+import os
 import socket
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,12 +34,43 @@ from typing import Any
 from urllib.parse import urlparse
 
 PRIMARY = ("jobseeker_core", "credit_query", "report_share")
+# 固定 sub：冷启动复用同一 user 键 / consent 落盘；形状贴近 users.id UUID
+DEV_WECHAT_SUB = "a1111111-2222-4333-8444-555555555501"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _b64url_json(segment: str) -> dict[str, Any]:
     pad = "=" * (-len(segment) % 4)
     raw = base64.urlsafe_b64decode(segment + pad)
     return json.loads(raw.decode("utf-8"))
+
+
+def make_looma_jwt(sub: str, *, email: str | None = None, name: str | None = None) -> str | None:
+    """与 gateway local_auth / resume decode_looma 同钥同 issuer；无 JWT_SECRET 则无法签发。"""
+    secret = (os.environ.get("JWT_SECRET") or "").strip()
+    if not secret:
+        return None
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload: dict[str, Any] = {
+        "sub": sub,
+        "iss": "looma",
+        "iat": now,
+        "exp": now + 86400 * 30,
+        "role": "user",
+        "tier": "free",
+    }
+    if email:
+        payload["email"] = email
+    if name:
+        payload["name"] = name
+    h = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64url(hmac.new(secret.encode("utf-8"), f"{h}.{p}".encode("utf-8"), hashlib.sha256).digest())
+    return f"{h}.{p}.{sig}"
 
 
 def user_key_from_auth(auth: str | None) -> str:
@@ -175,6 +212,39 @@ def make_handler(store: Store):
             auth = self.headers.get("Authorization")
             user = user_key_from_auth(auth)
             body = self._read_json()
+            if path == "/v1/auth/wechat":
+                # 开发者工具原生 wx.login → code 交换；勿用未验签的假签名（resume 会 401）
+                token = make_looma_jwt(
+                    DEV_WECHAT_SUB,
+                    email="dev-wechat@local.test",
+                    name="DevWeChat",
+                )
+                if not token:
+                    self._send(
+                        500,
+                        {
+                            "error": "jwt_secret_missing",
+                            "message": "stub 未读到 JWT_SECRET，无法签发可被 resume 校验的 token",
+                            "via": "legacy-stub-v2",
+                        },
+                    )
+                    return
+                self._send(
+                    200,
+                    {
+                        "access_token": token,
+                        "token": token,
+                        "token_type": "Bearer",
+                        "expires_in": 86400 * 30,
+                        "user": {
+                            "id": DEV_WECHAT_SUB,
+                            "nickname": "DevWeChat",
+                            "email": "dev-wechat@local.test",
+                        },
+                        "via": "legacy-stub-v2",
+                    },
+                )
+                return
             if path == "/v1/compliance/consent/grant":
                 scope = body.get("scope") or ""
                 scopes = body.get("scopes") if isinstance(body.get("scopes"), list) else None
