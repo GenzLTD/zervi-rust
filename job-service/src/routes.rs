@@ -178,15 +178,27 @@ async fn match_jobs(
 
 async fn library_match_payload(state: &AppState, resume_text: &str) -> Result<Value, String> {
     let jobs = load_jobs(state).await?;
-    let catalog_ids: Vec<String> = jobs.iter().filter_map(crate::library_match::job_id).collect();
+    let total_evaluated = jobs.iter().filter_map(crate::library_match::job_id).count();
+    if total_evaluated == 0 {
+        return Ok(json!({
+            "matches": [],
+            "total_evaluated": 0,
+            "match_status": "empty_library",
+        }));
+    }
     let ranked = crate::library_match::rank_library_jobs(resume_text, &jobs);
     if ranked.is_empty() {
         return Ok(json!({
             "matches": [],
-            "total_evaluated": catalog_ids.len(),
+            "total_evaluated": total_evaluated,
+            "match_status": "no_fit",
         }));
     }
-    let matches = if let Some(raw) = common::looma::call_llm(
+    let prompt_ids: Vec<String> = ranked
+        .iter()
+        .filter_map(|m| m.get("job_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    let matches = if let Some(raw) = common::looma::call_llm_unredacted(
         &state.settings,
         &crate::library_match::catalog_prompt(resume_text, &ranked, &jobs),
         0.2,
@@ -199,13 +211,14 @@ async fn library_match_payload(state: &AppState, resume_text: &str) -> Result<Va
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        crate::library_match::pin_to_catalog(&catalog_ids, &llm_matches, &ranked)
+        crate::library_match::pin_to_catalog(&prompt_ids, &llm_matches, &ranked)
     } else {
         ranked
     };
     Ok(json!({
         "matches": matches,
-        "total_evaluated": catalog_ids.len(),
+        "total_evaluated": total_evaluated,
+        "match_status": "ok",
     }))
 }
 

@@ -184,6 +184,7 @@ async fn upload_resume(
         &markdown,
         extracted.clone(),
         if extracted.is_some() { "processed" } else { "uploaded" },
+        None,
     )
     .await
     {
@@ -228,17 +229,38 @@ async fn ingest_resume(
     };
     let api_status = if body.extracted.is_some() { "processed" } else { "stored" };
     let doc_status = if body.extracted.is_some() { "processed" } else { "uploaded" };
-    match insert_resume(&state, &principal, &filename, &markdown, body.extracted, doc_status).await {
+    let fp = resume_content_fp(&principal.user_id, &markdown);
+    if let Some(id) = find_resume_id_by_fp(&state, &principal.user_id, &fp).await {
+        return Json(json!({
+            "resume_id": id,
+            "status": api_status,
+            "matches": [],
+            "total_evaluated": 0,
+            "match_status": "skipped_duplicate",
+            "match_error": "同一份简历已入库，未重复匹配、未再扣配额。可点「计算匹配」。",
+        }))
+        .into_response();
+    }
+    match insert_resume(
+        &state,
+        &principal,
+        &filename,
+        &markdown,
+        body.extracted,
+        doc_status,
+        Some(&fp),
+    )
+    .await
+    {
         Ok((id, _)) => {
             let matched = fetch_library_matches(&headers, &markdown).await;
-            let matches = matched.get("matches").cloned().unwrap_or(json!([]));
-            let total = matched.get("total_evaluated").cloned().unwrap_or(json!(0));
-            let _ = persist_resume_matches(&state, &id, &matches).await;
             Json(json!({
                 "resume_id": id,
                 "status": api_status,
-                "matches": matches,
-                "total_evaluated": total,
+                "matches": matched.get("matches").cloned().unwrap_or(json!([])),
+                "total_evaluated": matched.get("total_evaluated").cloned().unwrap_or(json!(0)),
+                "match_status": matched.get("match_status").cloned().unwrap_or(json!("ok")),
+                "match_error": matched.get("match_error").cloned().unwrap_or(json!(null)),
             }))
             .into_response()
         }
@@ -1248,6 +1270,7 @@ async fn insert_resume(
     markdown: &str,
     extracted: Option<Value>,
     doc_status: &str,
+    content_fp: Option<&str>,
 ) -> Result<(String, String), Response> {
     let owner = if principal.guest {
         principal.user_id.clone()
@@ -1261,6 +1284,9 @@ async fn insert_resume(
     });
     if let Some(extracted) = extracted {
         meta["extracted"] = extracted;
+    }
+    if let Some(fp) = content_fp {
+        meta["content_fp"] = json!(fp);
     }
     let provisional = format!("resume/{owner}/{}", uuid::Uuid::new_v4().simple());
     let model = documents::ActiveModel {
@@ -1351,10 +1377,38 @@ pub(crate) fn parse_meta(raw: Option<&str>) -> Value {
     }
 }
 
-/// ingest 成功后内部打 job-service 库内 match。失败不阻断入库（job-service 宕机时与现网一致：无匹配结果）。
+fn resume_content_fp(user_id: &str, markdown: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(user_id.as_bytes());
+    h.update(b"\n");
+    h.update(markdown.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn find_resume_id_by_fp(state: &AppState, user_id: &str, fp: &str) -> Option<String> {
+    let row = documents::Entity::find()
+        .filter(owner_filter(user_id))
+        .filter(sea_orm::sea_query::Expr::cust_with_values(
+            "metadata::json->>'content_fp' = $1",
+            [fp.to_string()],
+        ))
+        .order_by_desc(documents::Column::CreatedAt)
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()?;
+    Some(row.id.to_string())
+}
+
+/// ingest 成功后内部打 job-service 库内 match。失败不阻断入库，但带 match_status。
 async fn fetch_library_matches(headers: &HeaderMap, resume_text: &str) -> Value {
     if resume_text.trim().len() < 20 {
-        return json!({ "matches": [], "total_evaluated": 0 });
+        return json!({
+            "matches": [],
+            "total_evaluated": 0,
+            "match_status": "no_fit",
+        });
     }
     let origin = std::env::var("JOB_SERVICE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3004".into());
@@ -1372,30 +1426,37 @@ async fn fetch_library_matches(headers: &HeaderMap, resume_text: &str) -> Value 
         req = req.header("Authorization", auth);
     }
     match req.send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<Value>()
-            .await
-            .unwrap_or_else(|_| json!({ "matches": [], "total_evaluated": 0 })),
-        _ => json!({ "matches": [], "total_evaluated": 0 }),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.json::<Value>().await.unwrap_or(json!({}));
+            if status.is_success() {
+                let mut out = body;
+                if out.get("match_status").is_none() {
+                    out["match_status"] = json!("ok");
+                }
+                out
+            } else {
+                let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                let match_status = if status.as_u16() == 429 || code.contains("quota") {
+                    "quota_exceeded"
+                } else {
+                    "unavailable"
+                };
+                json!({
+                    "matches": [],
+                    "total_evaluated": 0,
+                    "match_status": match_status,
+                    "match_error": body.get("message").cloned().unwrap_or(json!(status.to_string())),
+                })
+            }
+        }
+        Err(e) => json!({
+            "matches": [],
+            "total_evaluated": 0,
+            "match_status": "unavailable",
+            "match_error": e.to_string(),
+        }),
     }
-}
-
-async fn persist_resume_matches(state: &AppState, resume_id: &str, matches: &Value) -> Result<(), ()> {
-    let Ok(id) = resume_id.parse::<i64>() else {
-        return Err(());
-    };
-    let row = documents::Entity::find_by_id(id)
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .ok_or(())?;
-    let mut meta = parse_meta(row.metadata.as_deref());
-    meta["matches"] = matches.clone();
-    let mut active: documents::ActiveModel = row.into();
-    active.metadata = Set(Some(meta.to_string()));
-    active.update(&state.db).await.map_err(|_| ())?;
-    Ok(())
 }
 
 fn parse_json_block(raw: &str) -> Option<Value> {

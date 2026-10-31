@@ -4,6 +4,8 @@
 use serde_json::{json, Value};
 
 const TOP_K: usize = 8;
+/// 词面基线门槛：低于此分不进入推荐，避免「无合适职位仍塞 8 条」。
+pub const MIN_SCORE: f64 = 0.15;
 
 pub fn job_id(job: &Value) -> Option<String> {
     job.get("id")
@@ -67,14 +69,22 @@ pub fn rank_library_jobs(resume_text: &str, jobs: &[Value]) -> Vec<Value> {
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(TOP_K);
-    scored.into_iter().map(|(_, row)| row).collect()
+    scored
+        .into_iter()
+        .filter(|(score, _)| *score >= MIN_SCORE)
+        .map(|(_, row)| row)
+        .collect()
 }
 
-pub fn pin_to_catalog(catalog_ids: &[String], llm_matches: &[Value], fallback: &[Value]) -> Vec<Value> {
+/// 只允许 LLM 给「送入 prompt 的候选」补 reasons/gaps；title/company/score 以库内为准。
+pub fn pin_to_catalog(prompt_ids: &[String], llm_matches: &[Value], fallback: &[Value]) -> Vec<Value> {
     let mut by_id: std::collections::BTreeMap<String, Value> = fallback
         .iter()
         .filter_map(|m| {
             let id = m.get("job_id").and_then(|v| v.as_str())?.to_string();
+            if !prompt_ids.iter().any(|p| p == &id) {
+                return None;
+            }
             Some((id, m.clone()))
         })
         .collect();
@@ -86,26 +96,7 @@ pub fn pin_to_catalog(catalog_ids: &[String], llm_matches: &[Value], fallback: &
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let Some(id) = id else { continue };
-        if !catalog_ids.iter().any(|c| c == &id) {
-            continue;
-        }
-        let mut row = by_id.remove(&id).unwrap_or_else(|| {
-            json!({
-                "job_id": id,
-                "title": raw.get("title").cloned().unwrap_or(json!("未命名职位")),
-                "score": 0.0,
-                "reasons": [],
-                "gaps": [],
-            })
-        });
-        if let Some(title) = raw.get("title").and_then(|v| v.as_str()) {
-            if !title.trim().is_empty() {
-                row["title"] = json!(title.trim());
-            }
-        }
-        if let Some(score) = as_f64(raw.get("score")).or_else(|| as_f64(raw.get("match_score"))) {
-            row["score"] = json!(score);
-        }
+        let Some(mut row) = by_id.remove(&id) else { continue };
         if let Some(reasons) = string_list(raw.get("reasons")) {
             if !reasons.is_empty() {
                 row["reasons"] = json!(reasons);
@@ -221,13 +212,6 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
-fn as_f64(v: Option<&Value>) -> Option<f64> {
-    let v = v?;
-    v.as_f64()
-        .or_else(|| v.as_i64().map(|n| n as f64))
-        .or_else(|| v.as_u64().map(|n| n as f64))
-}
-
 fn string_list(v: Option<&Value>) -> Option<Vec<String>> {
     let arr = v?.as_array()?;
     Some(
@@ -259,23 +243,38 @@ mod tests {
 
     #[test]
     fn drops_hallucinated_llm_jobs() {
-        let catalog = vec!["demo-1".to_string()];
+        let prompt = vec!["demo-1".to_string()];
         let fallback = vec![json!({
             "job_id": "demo-1",
             "title": "高级 Rust 后端工程师",
+            "company": "深伯乐",
             "score": 0.4,
             "reasons": ["词面"],
             "gaps": []
         })];
         let llm = vec![
-            json!({"job_id": "demo-1", "reasons": ["库内职位"], "gaps": ["补量化"]}),
+            json!({"job_id": "demo-1", "title": "改名", "company": "幻觉公司", "score": 0.99, "reasons": ["库内职位"], "gaps": ["补量化"]}),
             json!({"job_id": "phantom-99", "title": "编造的公司", "score": 0.99}),
+            json!({"job_id": "demo-2", "title": "全库有但没进 prompt"}),
         ];
-        let pinned = pin_to_catalog(&catalog, &llm, &fallback);
+        let pinned = pin_to_catalog(&prompt, &llm, &fallback);
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0]["job_id"], "demo-1");
+        assert_eq!(pinned[0]["title"], "高级 Rust 后端工程师");
+        assert_eq!(pinned[0]["company"], "深伯乐");
+        assert_eq!(pinned[0]["score"], 0.4);
         assert_eq!(pinned[0]["reasons"][0], "库内职位");
         assert_eq!(pinned[0]["gaps"][0], "补量化");
+    }
+
+    #[test]
+    fn low_score_jobs_are_not_recommended() {
+        let jobs = vec![json!({"id": "demo-x", "title": "销售", "desc": "电话销售"})];
+        let ranked = rank_library_jobs(
+            "3年 Rust 后端，负责支付网关核心链路与性能优化。",
+            &jobs,
+        );
+        assert!(ranked.is_empty());
     }
 
     #[test]

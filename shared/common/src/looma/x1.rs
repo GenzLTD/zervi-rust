@@ -172,14 +172,63 @@ fn clamp_prompt(prompt: &str) -> String {
     format!("{truncated}\n…（原文过长，已截取前 {max} 字符）")
 }
 
+/// 未脱敏材料（简历匹配）默认禁止云模型。显式 `JOB_MATCH_ALLOW_CLOUD_LLM=1` 才放行。
+pub fn allow_cloud_for_unredacted() -> bool {
+    matches!(
+        std::env::var("JOB_MATCH_ALLOW_CLOUD_LLM")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// 未脱敏调用可用的 provider：默认只留 ollama；开云开关后才走 X1 全序。
+pub fn unredacted_llm_providers(settings: &Settings) -> Vec<String> {
+    filter_unredacted_providers(settings.provider_order(), allow_cloud_for_unredacted())
+}
+
+pub fn filter_unredacted_providers(order: Vec<String>, allow_cloud: bool) -> Vec<String> {
+    if allow_cloud {
+        order
+    } else {
+        order.into_iter().filter(|p| p == "ollama").collect()
+    }
+}
+
 /// 按 X1 过滤后的顺序调用。没有任何可用 provider 时返回 None（不回退 DeepSeek）。
 pub async fn call_llm(settings: &Settings, prompt: &str, temperature: f32) -> Option<String> {
+    dispatch_llm(settings, prompt, temperature, &settings.provider_order()).await
+}
+
+/// 简历等未脱敏文本：默认只打本机 Ollama。
+pub async fn call_llm_unredacted(
+    settings: &Settings,
+    prompt: &str,
+    temperature: f32,
+) -> Option<String> {
+    dispatch_llm(
+        settings,
+        prompt,
+        temperature,
+        &unredacted_llm_providers(settings),
+    )
+    .await
+}
+
+async fn dispatch_llm(
+    settings: &Settings,
+    prompt: &str,
+    temperature: f32,
+    providers: &[String],
+) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(llm_timeout_secs()))
         .build()
         .ok()?;
     let prompt = clamp_prompt(prompt);
-    for provider in settings.provider_order() {
+    for provider in providers {
         let result = match provider.as_str() {
             "deepseek" if key_usable(&settings.deepseek_api_key) => {
                 post_chat(
@@ -296,6 +345,20 @@ async fn post_ollama(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unredacted_defaults_to_ollama_only() {
+        let order = filter_unredacted_providers(
+            vec!["deepseek".into(), "ollama".into(), "openai".into()],
+            false,
+        );
+        assert_eq!(order, vec!["ollama".to_string()]);
+        let cloud = filter_unredacted_providers(
+            vec!["deepseek".into(), "ollama".into()],
+            true,
+        );
+        assert_eq!(cloud, vec!["deepseek".to_string(), "ollama".to_string()]);
+    }
 
     #[test]
     fn overseas_strips_deepseek_and_does_not_fallback() {
