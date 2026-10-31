@@ -41,6 +41,7 @@ use sea_orm::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -228,7 +229,19 @@ async fn ingest_resume(
     let api_status = if body.extracted.is_some() { "processed" } else { "stored" };
     let doc_status = if body.extracted.is_some() { "processed" } else { "uploaded" };
     match insert_resume(&state, &principal, &filename, &markdown, body.extracted, doc_status).await {
-        Ok((id, _)) => Json(json!({ "resume_id": id, "status": api_status })).into_response(),
+        Ok((id, _)) => {
+            let matched = fetch_library_matches(&headers, &markdown).await;
+            let matches = matched.get("matches").cloned().unwrap_or(json!([]));
+            let total = matched.get("total_evaluated").cloned().unwrap_or(json!(0));
+            let _ = persist_resume_matches(&state, &id, &matches).await;
+            Json(json!({
+                "resume_id": id,
+                "status": api_status,
+                "matches": matches,
+                "total_evaluated": total,
+            }))
+            .into_response()
+        }
         Err(r) => r,
     }
 }
@@ -1336,6 +1349,53 @@ pub(crate) fn parse_meta(raw: Option<&str>) -> Value {
         Some(v) if v.is_object() => v,
         _ => json!({}),
     }
+}
+
+/// ingest 成功后内部打 job-service 库内 match。失败不阻断入库（job-service 宕机时与现网一致：无匹配结果）。
+async fn fetch_library_matches(headers: &HeaderMap, resume_text: &str) -> Value {
+    if resume_text.trim().len() < 20 {
+        return json!({ "matches": [], "total_evaluated": 0 });
+    }
+    let origin = std::env::var("JOB_SERVICE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3004".into());
+    let url = format!("{}/v1/jobs/match", origin.trim_end_matches('/'));
+    let mut req = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+        .post(url)
+        .json(&json!({ "resume_text": resume_text }));
+    if let Some(auth) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        req = req.header("Authorization", auth);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|_| json!({ "matches": [], "total_evaluated": 0 })),
+        _ => json!({ "matches": [], "total_evaluated": 0 }),
+    }
+}
+
+async fn persist_resume_matches(state: &AppState, resume_id: &str, matches: &Value) -> Result<(), ()> {
+    let Ok(id) = resume_id.parse::<i64>() else {
+        return Err(());
+    };
+    let row = documents::Entity::find_by_id(id)
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(())?;
+    let mut meta = parse_meta(row.metadata.as_deref());
+    meta["matches"] = matches.clone();
+    let mut active: documents::ActiveModel = row.into();
+    active.metadata = Set(Some(meta.to_string()));
+    active.update(&state.db).await.map_err(|_| ())?;
+    Ok(())
 }
 
 fn parse_json_block(raw: &str) -> Option<Value> {
